@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import WebSocket, { WebSocketServer } from 'ws';
 import http from 'http';
 import { v4 as uuidv4 } from 'uuid';
@@ -36,10 +37,50 @@ wsServer.on('connection', (connection: WebSocket, request) => {
     connection.on('message', (message: Buffer) => {
         try {
             const parsedMessage = JSON.parse(message.toString());
-            console.log('Received message:', parsedMessage);
+            console.log('Received message from', username, ':', parsedMessage);
             
-            // Handle video sync messages by broadcasting to all connections in the room
-            if (parsedMessage.type === 'playbackState' || parsedMessage.type === 'seekTo' || parsedMessage.type === 'play' || parsedMessage.type === 'pause') {
+            // Handle video sync messages - only broadcast if they have adminId
+            if (parsedMessage.type === 'playbackState' || parsedMessage.type === 'seekTo') {
+                const roomId = users[uuid]?.roomId;
+                if (roomId && parsedMessage.adminId) {
+                    console.log(`Broadcasting admin sync message from ${username} to room ${roomId}`);
+                    // Broadcast to all connections in the room except sender
+                    Object.entries(connections).forEach(([userId, conn]) => {
+                        if (users[userId]?.roomId === roomId && userId !== uuid) {
+                            try {
+                                conn.send(JSON.stringify(parsedMessage));
+                                console.log(`Broadcasted ${parsedMessage.type} to ${userId}`);
+                            } catch (error) {
+                                console.error(`Error broadcasting to ${userId}:`, error);
+                            }
+                        }
+                    });
+                } else if (roomId && !parsedMessage.adminId) {
+                    console.warn(`Ignoring sync message from non-admin user ${username}`);
+                }
+            }
+            
+            // Handle state requests - broadcast to admin only
+            if (parsedMessage.type === 'requestState') {
+                const roomId = users[uuid]?.roomId;
+                if (roomId) {
+                    console.log(`Broadcasting state request from ${username} to room ${roomId}`);
+                    // Broadcast to all connections in the room
+                    Object.entries(connections).forEach(([userId, conn]) => {
+                        if (users[userId]?.roomId === roomId && userId !== uuid) {
+                            try {
+                                conn.send(JSON.stringify(parsedMessage));
+                                console.log(`Broadcasted state request to ${userId}`);
+                            } catch (error) {
+                                console.error(`Error broadcasting state request to ${userId}:`, error);
+                            }
+                        }
+                    });
+                }
+            }
+            
+            // Handle other message types (games, notifications, etc.)
+            if (parsedMessage.type === 'trackEnded' || parsedMessage.type === 'test') {
                 const roomId = users[uuid]?.roomId;
                 if (roomId) {
                     // Broadcast to all connections in the room
@@ -73,10 +114,29 @@ wsServer.on('connection', (connection: WebSocket, request) => {
     connection.on('close', () => {
         console.log(`${username} disconnected from room ${roomId}`);
         gameManager.removePlayer(roomId, uuid);
+        
+        // Remove member from room in Firestore and handle admin transfer
+        handleMemberDisconnection(roomId, uuid);
+        
         delete connections[uuid];
         delete users[uuid];
     });
+
+    connection.on('error', (error) => {
+        console.error(`WebSocket error for user ${username}:`, error);
+    });
 });
+
+// Function to handle member disconnection
+async function handleMemberDisconnection(roomId: string, userId: string) {
+    try {
+        // Import here to avoid issues with top-level imports
+        const { removeMemberFromRoomAdmin } = await import('./lib/firebase-admin');
+        await removeMemberFromRoomAdmin(roomId, userId);
+    } catch (error) {
+        console.error('Error handling member disconnection:', error);
+    }
+}
 
 server.listen(port, () => {
     console.log(`WebSocket server is running on port ${port}`);

@@ -1,11 +1,11 @@
 
 'use client';
 
-import { useEffect, useState, use } from "react";
+import { useEffect, useState, use, useMemo, useCallback } from "react";
 import { notFound, useRouter } from "next/navigation";
 import { listenToRoom } from "@/lib/firebase-client";
 import type { Room } from "@/lib/types";
-import { Loader2 } from "lucide-react";
+import { Loader2, Menu, X, ArrowLeft } from "lucide-react";
 import AiDjPanel from "@/components/room/ai-dj";
 import Chat from "@/components/room/chat";
 import Presence from "@/components/room/presence";
@@ -13,9 +13,8 @@ import Queue from "@/components/room/queue";
 import VideoPlayer from "@/components/room/video-player";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useAuth } from "@/hooks/use-auth";
-import { doc, updateDoc, arrayUnion, getDocFromServer, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, updateDoc, arrayUnion, getDocs, collection, query, where } from 'firebase/firestore';
 import { db } from '@/lib/firebase-client';
-import { playNextTrackInQueue } from '@/lib/firebase-client-service';
 import Notifications from '@/components/room/notifications';
 import { useSocket } from '@/hooks/use-socket';
 import { ReadyState } from 'react-use-websocket';
@@ -25,15 +24,23 @@ import { Button } from '@/components/ui/button';
 
 export default function RoomPage({ params: paramsPromise }: { params: Promise<{ slug: string }> }) {
     const params = use(paramsPromise);
-    const [room, setRoom] = useState<Room | null>(null);
-    const [loading, setLoading] = useState(true);
-    const [activeGame, setActiveGame] = useState<{ gameId: string; players: string[] } | null>(null);
+    const [room, setRoom] = useState<Room | null>(null); // Re-added room state
+    const [loading, setLoading] = useState(true); // Re-added loading state
+    const [activeGame, setActiveGame] = useState<{ gameId: string; players: string[] } | null>(null); // Re-added activeGame state
+    const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+    const [activeTab, setActiveTab] = useState('video');
+    const [socialView, setSocialView] = useState<'ai-dj' | 'chat'>('ai-dj');
+    const [desktopView, setDesktopView] = useState<'queue' | 'members' | 'games'>('queue');
+
     const { user, loading: authLoading } = useAuth();
     const router = useRouter();
     const { toast } = useToast();
+    
+    // Ensure room.id is available before passing to useSocket
+    const socketRoomId = room?.id; 
     const { readyState, lastJsonMessage, sendJsonMessage } = useSocket(
         user?.uid, 
-        room?.id
+        socketRoomId || undefined // Changed from null to undefined
     );
 
     const connectionStatus = {
@@ -44,246 +51,519 @@ export default function RoomPage({ params: paramsPromise }: { params: Promise<{ 
         [ReadyState.UNINSTANTIATED]: 'Uninstantiated',
     }[readyState];
 
-    const playingTrack = room?.queue.find(t => t.status === 'playing');
-    const roomHistory = room?.queue
-        .filter(t => t.status === 'played')
-        .map(track => ({
-            videoId: track.videoId,
-            title: track.title,
-            upvotes: track.upvotes.length,
-            downvotes: track.downvotes.length,
-        })) || [];
+    // Memoize derived values to prevent unnecessary recalculations and re-renders
+    const { playingTrack, roomHistory, isOwner } = useMemo(() => {
+        if (!room || !user) {
+            return { playingTrack: null, roomHistory: [], isOwner: false };
+        }
 
+        const playing = room.queue.find(t => t.status === 'playing') || null;
+        const history = room.queue
+            .filter(t => t.status === 'played')
+            .map(track => ({
+                videoId: track.videoId,
+                title: track.title,
+                upvotes: track.upvotes.length,
+                downvotes: track.downvotes.length,
+            }));
+        const owner = user.uid === room.ownerId;
+
+        return { playingTrack: playing, roomHistory: history, isOwner: owner };
+    }, [room, user?.uid]); // Only recalculate when room or user.uid changes
+
+    // Memoize callback functions to prevent unnecessary re-renders
+    const handleGameStart = useCallback((gameId: string) => {
+        setActiveGame({ gameId, players: [] });
+    }, []);
+
+    const handleMobileMenuToggle = useCallback(() => {
+        setMobileMenuOpen(prev => !prev);
+    }, []);
+
+    const handleTabChange = useCallback((value: string) => {
+        setActiveTab(value);
+    }, []);
+
+    const handleSocialViewChange = useCallback((view: 'ai-dj' | 'chat') => {
+        setSocialView(view);
+    }, []);
+
+    const handleDesktopViewChange = useCallback((view: 'queue' | 'members' | 'games') => {
+        setDesktopView(view);
+    }, []);
+
+    const handleBackToRooms = useCallback(() => {
+        router.push('/rooms');
+    }, [router]);
+
+    // Memoize WebSocket message handling to prevent unnecessary re-renders
+    const handleWebSocketMessage = useCallback((message: any) => {
+        if (message.type === 'gameInvite') {
+            const { from, gameId, inviteId } = message;
+            toast({
+                title: 'Game Invite!',
+                description: `${from} has invited you to a game of ${gameId}.`,
+                action: (
+                    <div className="flex gap-2">
+                        <Button size="sm" className="h-8 px-3 text-sm"
+                            onClick={() => sendJsonMessage({ type: 'acceptInvite', gameId, from })}>
+                            Accept
+                        </Button>
+                        <Button size="sm" variant="outline" className="h-8 px-3 text-sm"
+                            onClick={() => sendJsonMessage({ type: 'rejectInvite', gameId, from })}>
+                            Reject
+                        </Button>
+                    </div>
+                ),
+            });
+        } else if (message.type === 'gameStart') {
+            console.log('Game starting message received:', message);
+            toast({
+                title: 'Game Starting!',
+                description: message.message,
+            });
+            // Set the active game
+            if (message.players) {
+                console.log('Setting active game:', { gameId: message.gameId, players: message.players });
+                setActiveGame({ gameId: message.gameId, players: message.players });
+            }
+        } else if (message.type === 'gameUpdate') {
+            // Handle game state updates
+            console.log('Game update received:', message);
+        } else if (message.type === 'gameReset') {
+            setActiveGame(null);
+            toast({
+                title: 'Game Reset',
+                description: 'Game has been reset. You can start a new game.',
+            });
+        }
+    }, [sendJsonMessage, toast]);
+
+    // Handle WebSocket messages with memoized handler
     useEffect(() => {
         if (lastJsonMessage) {
-            const message = lastJsonMessage as any;
-            if (message.type === 'gameInvite') {
-                const { from, gameId, inviteId } = message;
-                toast({
-                    title: 'Game Invite!',
-                    description: `${from} has invited you to a game of ${gameId}.`,
-                    action: (
-                        <div className="flex gap-2">
-                            <Button size="sm" className="h-8 px-3 text-sm"
-                                onClick={() => sendJsonMessage({ type: 'acceptInvite', gameId, from })}>
-                                Accept
-                            </Button>
-                            <Button size="sm" variant="outline" className="h-8 px-3 text-sm"
-                                onClick={() => sendJsonMessage({ type: 'rejectInvite', gameId, from })}>
-                                Reject
-                            </Button>
-                        </div>
-                    ),
-                });
-            } else if (message.type === 'gameStart') {
-                toast({
-                    title: 'Game Starting!',
-                    description: message.message,
-                });
-                // Set the active game
-                if (message.players) {
-                    setActiveGame({ gameId: message.gameId, players: message.players });
-                }
-            } else if (message.type === 'gameUpdate') {
-                // Handle game updates
-                if (message.type === 'gameStart' && message.players) {
-                    setActiveGame({ gameId: message.gameId, players: message.players });
-                    toast({
-                        title: 'Game Started!',
-                        description: `Game of ${message.gameId} is now active!`,
-                    });
-                }
-            } else if (message.type === 'gameReset') {
-                setActiveGame(null);
-                toast({
-                    title: 'Game Reset',
-                    description: 'Game has been reset. You can start a new game.',
-                });
-            } else if (message.type === 'inviteRejected') {
-                if (message.from) {
-                    // Someone rejected your invitation
-                    toast({
-                        title: 'Invitation Rejected',
-                        description: message.message,
-                    });
-                } else {
-                    // You rejected an invitation
-                    toast({
-                        title: 'Invitation Rejected',
-                        description: message.message,
-                    });
-                }
-            } else if (message.type === 'noAcceptances') {
-                toast({
-                    title: 'No Acceptances',
-                    description: message.message,
-                });
-            } else if (message.type === 'inviteCancelled') {
-                toast({
-                    title: 'Invitation Cancelled',
-                    description: message.message,
-                });
-            }
+            handleWebSocketMessage(lastJsonMessage as any);
         }
-    }, [lastJsonMessage, user?.uid, sendJsonMessage, toast]);
-
-    useEffect(() => {
-        if (room?.id && (!playingTrack && room.queue.length > 0)) {
-            playNextTrackInQueue(room.id);
-        }
-    }, [room?.id, playingTrack, room?.queue.length]);
-
-    useEffect(() => {
-        if (room?.currentPlayback?.ended) {
-            playNextTrackInQueue(room.id);
-        }
-    }, [room?.currentPlayback?.ended, room?.id]);
-
-    useEffect(() => {
-        const handleBeforeUnload = (e: BeforeUnloadEvent) => {
-            // Room ownership transfer removed due to Firebase Admin SDK issues
-            // if (user?.uid === room?.ownerId && room.members.length > 1) {
-            //     const newOwner = room.members.find(m => m.id !== user.uid);
-            //     if (newOwner) {
-            //         transferRoomOwnership(room.id, newOwner.id);
-            //     }
-            // }
-        };
-
-        window.addEventListener('beforeunload', handleBeforeUnload);
-
-        return () => {
-            window.removeEventListener('beforeunload', handleBeforeUnload);
-        };
-    }, [user?.uid, room]);
+    }, [lastJsonMessage, handleWebSocketMessage]);
 
     useEffect(() => {
         if (authLoading) return;
+
         if (!user) {
             router.push('/login');
             return;
         }
 
-        const setupRoom = async () => {
+        // Add timeout to prevent infinite loading
+        const timeoutId = setTimeout(() => {
+            console.log('⏰ Room loading timeout reached');
+            setLoading(false);
+        }, 10000); // 10 second timeout
+
+        // First, find the room by slug to get the room ID
+        const findRoomBySlug = async () => {
             try {
-                // Fetch the initial room data to get the ID
+                console.log('🔍 Searching for room with slug:', params.slug);
                 const q = query(collection(db, 'rooms'), where('slug', '==', params.slug));
                 const querySnapshot = await getDocs(q);
+                
+                console.log('📋 Query result:', querySnapshot.size, 'rooms found');
 
                 if (querySnapshot.empty) {
-                    notFound();
+                    console.log('❌ Room not found with slug:', params.slug);
+                    setLoading(false);
+                    clearTimeout(timeoutId);
                     return;
                 }
-                const initialRoomDoc = querySnapshot.docs[0];
-                const initialRoomId = initialRoomDoc.id;
-
-                // Add user to members list if not already present
-                const roomRef = doc(db, 'rooms', initialRoomId);
-                const roomSnapshot = await getDocFromServer(roomRef);
-                const currentRoomData = roomSnapshot.data() as Room;
-                const isMember = currentRoomData.members.some(m => m.id === user.uid);
+                
+                const roomDoc = querySnapshot.docs[0];
+                const roomData = { id: roomDoc.id, ...roomDoc.data() } as Room;
+                console.log('✅ Room found:', roomData.name, 'ID:', roomData.id);
+                
+                // Add user to members if not already present
+                const isMember = roomData.members.some(m => m.id === user.uid);
+                console.log('👤 User membership check:', isMember ? 'Already member' : 'Adding user to room');
 
                 if (!isMember) {
-                    const userProfile = { id: user.uid, name: user.displayName || 'Anonymous', avatarUrl: user.photoURL || '' };
+                    const userProfile = { 
+                        id: user.uid, 
+                        name: user.displayName || 'Anonymous', 
+                        avatarUrl: user.photoURL || '' 
+                    };
+                    
+                    const roomRef = doc(db, 'rooms', roomData.id);
                     await updateDoc(roomRef, { 
                         members: arrayUnion(userProfile),
-                        totalMembers: currentRoomData.totalMembers + 1 
+                        totalMembers: roomData.totalMembers + 1 
                     });
+                    
+                    // Update local room data
+                    roomData.members.push(userProfile);
+                    roomData.totalMembers += 1;
+                    console.log('✅ User added to room');
                 }
-
-                // Check if current admin is still in the room, if not, transfer admin to the first member
-                if (currentRoomData.ownerId && !currentRoomData.members.some(m => m.id === currentRoomData.ownerId)) {
-                    const newAdmin = currentRoomData.members[0];
-                    if (newAdmin) {
-                        await updateDoc(roomRef, { 
-                            ownerId: newAdmin.id 
-                        });
-                        console.log(`Admin transferred to ${newAdmin.name} (${newAdmin.id})`);
-                    }
-                }
-
-                const unsubscribe = listenToRoom(initialRoomId, (updatedRoom) => {
+                
+                setRoom(roomData);
+                setLoading(false);
+                clearTimeout(timeoutId);
+                console.log('🎉 Room loaded successfully, setting up real-time listener');
+                
+                // Now set up real-time listener with the room ID
+                const unsubscribe = listenToRoom(roomData.id, (updatedRoom) => {
+                    console.log('🔄 Room updated via real-time listener');
                      setRoom(updatedRoom);
-                     setLoading(false);
                 });
 
-                return () => unsubscribe();
+                return unsubscribe;
             } catch (error) {
-                console.error("Error setting up room:", error);
+                console.error('❌ Error finding room:', error);
                 setLoading(false);
-                notFound();
+                clearTimeout(timeoutId);
             }
         };
-
-        setupRoom();
+        
+        findRoomBySlug();
+        
+        // Periodic cleanup - ensure user is properly registered in the room
+        const cleanupInterval = setInterval(() => {
+            if (room && user && !authLoading) {
+                const isMember = room.members.some(m => m.id === user.uid);
+                if (!isMember) {
+                    console.log('🔧 User not in members list, re-adding...');
+                    const userProfile = { 
+                        id: user.uid, 
+                        name: user.displayName || 'Anonymous', 
+                        avatarUrl: user.photoURL || '' 
+                    };
+                    
+                    const roomRef = doc(db, 'rooms', room.id);
+                    updateDoc(roomRef, { 
+                        members: arrayUnion(userProfile)
+                    }).catch(error => {
+                        console.warn('Error re-adding user to room:', error);
+                    });
+                }
+            }
+        }, 30000); // Check every 30 seconds
+        
+        // Handle browser close/refresh
+        const handleBeforeUnload = () => {
+            if (room && user) {
+                // Use sendBeacon for reliable cleanup on page unload
+                navigator.sendBeacon(`/api/leave-room?roomId=${room.id}&userId=${user.uid}`);
+            }
+        };
+        
+        window.addEventListener('beforeunload', handleBeforeUnload);
+        
+        return () => {
+            clearTimeout(timeoutId);
+            clearInterval(cleanupInterval);
+            window.removeEventListener('beforeunload', handleBeforeUnload);
+            
+            // Clean up when leaving the room
+            if (room && user) {
+                console.log('🚪 User leaving room, cleaning up...');
+                // Remove user from room members when component unmounts
+                import('@/lib/firebase-client-service').then(({ removeMemberFromRoom }) => {
+                    removeMemberFromRoom(room.id, user.uid).catch(error => {
+                        console.warn('Error removing member on cleanup:', error);
+                    });
+                });
+            }
+        };
     }, [params.slug, user, authLoading, router]);
 
     if (loading || authLoading) {
         return (
-            <div className="flex items-center justify-center min-h-[calc(100vh-theme(height.14))]">
-                <Loader2 className="h-8 w-8 animate-spin text-primary" />
-                <p className="ml-4">Joining room...</p>
+            <div className="min-h-screen bg-background flex items-center justify-center">
+                <div className="text-center space-y-4">
+                    <Loader2 className="h-8 w-8 animate-spin mx-auto text-primary" />
+                    <p className="text-muted-foreground">Loading room...</p>
+                    <p className="text-xs text-muted-foreground">Room: {params.slug}</p>
+                    {authLoading && <p className="text-xs text-muted-foreground">Authenticating...</p>}
+                    {loading && !authLoading && <p className="text-xs text-muted-foreground">Connecting to room...</p>}
+                </div>
             </div>
-        )
+        );
     }
 
     if (!room) {
-      // This can happen if the room is deleted or there's an error after loading
-      return notFound();
+        return (
+            <div className="min-h-screen bg-background flex items-center justify-center">
+                <div className="text-center space-y-4">
+                    <h1 className="text-2xl font-bold text-foreground">Room Not Found</h1>
+                    <p className="text-muted-foreground">The room "{params.slug}" could not be found.</p>
+                    <Button onClick={handleBackToRooms}>
+                        Back to Rooms
+                    </Button>
+                </div>
+            </div>
+        );
     }
-    
+
     return (
-        <div className="container mx-auto p-4 md:p-6 lg:p-8 flex-1 relative">
-            <Notifications roomId={room.id} />
-            <div className="grid grid-cols-1 md:grid-cols-3 md:gap-8 h-full">
-                {/* Main Content: Video Player and Presence */}
-                <div className="md:col-span-2 flex flex-col gap-6">
-                    <div>
-                        <h1 className="font-headline text-3xl font-bold">{room.name}</h1>
-                        <p className="text-muted-foreground">Welcome to the chill zone. Add a song to get started.</p>
-                        <p className="text-sm text-muted-foreground">Connection Status: {connectionStatus}</p>
+        <div className="min-h-screen bg-background">
+            {/* Mobile-First Header */}
+            <header className="sticky top-0 z-50 w-full border-b border-border/40 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+                <div className="container-mobile flex h-14 items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={handleBackToRooms}
+                            className="p-2 h-8 w-8"
+                        >
+                            <ArrowLeft className="h-4 w-4" />
+                        </Button>
+                        <div className="flex flex-col">
+                            <h1 className="font-headline text-sm font-semibold leading-tight">{room.name}</h1>
+                            <p className="text-xs text-muted-foreground">{room.members.length} members</p>
+                        </div>
                     </div>
-                    <VideoPlayer track={playingTrack} roomId={room.id} isOwner={user?.uid === room.ownerId} />
-                    <Presence members={room.members} totalMembers={room.totalMembers} roomId={room.id} />
+                    
+                    <div className="flex items-center gap-2">
+                        {/* Mobile Menu Button */}
+                        <button
+                            className="sm:hidden p-2 rounded-md hover:bg-accent/10 transition-colors"
+                            onClick={handleMobileMenuToggle}
+                            aria-label="Toggle mobile menu"
+                        >
+                            {mobileMenuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+                        </button>
+                    </div>
+                </div>
+                
+                {/* Mobile Menu */}
+                {mobileMenuOpen && (
+                    <div className="sm:hidden border-t border-border/40 bg-background/95 backdrop-blur">
+                        <div className="container-mobile py-4 space-y-3">
+                            <div className="grid grid-cols-2 gap-2">
+                                <Button
+                                    variant={activeTab === 'video' ? 'default' : 'outline'}
+                                    size="sm"
+                                    onClick={() => handleTabChange('video')}
+                                    className="w-full"
+                                >
+                                    Video
+                                </Button>
+                                <Button
+                                    variant={activeTab === 'queue' ? 'default' : 'outline'}
+                                    size="sm"
+                                    onClick={() => handleTabChange('queue')}
+                                    className="w-full"
+                                >
+                                    Queue
+                                </Button>
+                            </div>
+                            <div className="grid grid-cols-2 gap-2">
+                                <Button
+                                    variant={activeTab === 'social' ? 'default' : 'outline'}
+                                    size="sm"
+                                    onClick={() => handleTabChange('social')}
+                                    className="w-full"
+                                >
+                                    Social
+                                </Button>
+                                <Button
+                                    variant={activeTab === 'games' ? 'default' : 'outline'}
+                                    size="sm"
+                                    onClick={() => handleTabChange('games')}
+                                    className="w-full"
+                                >
+                                    Games
+                                </Button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </header>
+
+            {/* Mobile-First Content Layout */}
+            <div className="container-mobile py-4">
+                {/* Desktop Layout - Grid */} 
+                <div className="hidden lg:grid lg:grid-cols-[2fr_1fr] lg:gap-8 min-h-[calc(100vh-theme(spacing.14))]">
+                                            {/* Left Column: Video Player, In The Room, and Social Toggle */} 
+                        <div className="flex flex-col space-y-4">
+                            {/* Video Player Component */}
+                                                         <VideoPlayer 
+                                 roomId={room.id} 
+                                 track={playingTrack || undefined} 
+                                 isOwner={isOwner} 
+                                 queue={room.queue}
+                             />
+                        {/* In The Room (Presence) component, always visible below video player */}
+                        <Presence members={room.members} totalMembers={room.totalMembers} roomId={room.id} ownerId={room.ownerId} />
+
+                        {/* Desktop Social Hub Toggle */}
+                        <div className="space-y-4 pt-4">
+                            <div className="flex items-center justify-between">
+                                <h3 className="font-headline text-lg font-semibold">Social Hub</h3>
+                                <div className="flex items-center gap-2 rounded-full border border-primary/20 p-1">
+                                    <button
+                                        onClick={() => handleSocialViewChange('ai-dj')}
+                                        className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                            socialView === 'ai-dj' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                        }`}
+                                    >
+                                        AI DJ
+                                    </button>
+                                    <button
+                                        onClick={() => handleSocialViewChange('chat')}
+                                        className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                            socialView === 'chat' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                        }`}
+                                    >
+                                        Chat
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            {/* Conditional rendering based on social view */}
+                            {socialView === 'ai-dj' ? (
+                                <div className="space-y-4">
+                                    <AiDjPanel 
+                                        roomHistory={roomHistory} 
+                                        currentTrack={playingTrack || undefined} // Pass undefined instead of null
+                                        roomId={room.id} 
+                                    />
+                                </div>
+                            ) : (
+                                <div className="space-y-4">
+                                    <Chat roomId={room.id} />
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Right Column: Dynamic Content (Queue, Members, Games) */}
+                    <div className="lg:col-span-1 space-y-6">
+                        <div className="flex items-center justify-between">
+                            <h3 className="font-headline text-lg font-semibold">Room Content</h3>
+                            <div className="flex items-center gap-2 rounded-full border border-primary/20 p-1">
+                                <button
+                                    onClick={() => handleDesktopViewChange('queue')}
+                                    className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                        desktopView === 'queue' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                    }`}
+                                >
+                                    Queue
+                                </button>
+                                <button
+                                    onClick={() => handleDesktopViewChange('members')}
+                                    className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                        desktopView === 'members' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                    }`}
+                                >
+                                    Members
+                                </button>
+                                <button
+                                    onClick={() => handleDesktopViewChange('games')}
+                                    className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                        desktopView === 'games' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                    }`}
+                                >
+                                    Games
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Conditional rendering based on desktop view */}
+                        {desktopView === 'queue' && (
+                            <Queue roomId={room.id} queue={room.queue} isOwner={isOwner} />
+                        )}
+                        {desktopView === 'members' && (
+                            <Presence members={room.members} totalMembers={room.totalMembers} roomId={room.id} ownerId={room.ownerId} />
+                        )}
+                        {desktopView === 'games' && (
+                            <GameLobby 
+                                roomId={room.id} 
+                                activeGame={activeGame}
+                                onGameStart={handleGameStart} 
+                            />
+                        )}
+                    </div>
                 </div>
 
-                {/* Sidebar: Queue, Chat, AI DJ */}
-                <div className="md:col-span-1 flex flex-col h-full mt-8 md:mt-0">
-                    <Tabs defaultValue="queue" className="flex flex-col flex-grow glassmorphism rounded-lg">
-                        <TabsList className="grid w-full grid-cols-4 bg-transparent p-2">
-                            <TabsTrigger value="queue">Queue</TabsTrigger>
-                            <TabsTrigger value="chat">Chat</TabsTrigger>
-                            <TabsTrigger value="ai-dj">AI DJ</TabsTrigger>
-                            <TabsTrigger value="game">Game</TabsTrigger>
+                {/* Mobile Layout - Tab-based */}
+                <div className="lg:hidden space-y-4">
+                    {/* Mobile Tabs */}
+                    <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
+                        <TabsList className="grid w-full grid-cols-4 tabs-mobile">
+                            <TabsTrigger value="video" className="text-xs">Video</TabsTrigger>
+                            <TabsTrigger value="queue" className="text-xs">Queue</TabsTrigger>
+                            <TabsTrigger value="social" className="text-xs">Social</TabsTrigger>
+                            <TabsTrigger value="games" className="text-xs">Games</TabsTrigger>
                         </TabsList>
-                        <div className="flex-grow overflow-hidden">
-                          <TabsContent value="queue" className="h-full mt-0">
-                              <Queue roomId={room.id} queue={room.queue} isOwner={user?.uid === room.ownerId} />
+                        
+                        <TabsContent value="video" className="space-y-4 mt-4">
+                            <VideoPlayer 
+                                roomId={room.id} 
+                                track={playingTrack || undefined} 
+                                isOwner={isOwner} 
+                                queue={room.queue}
+                            />
                           </TabsContent>
-                          <TabsContent value="chat" className="h-full mt-0">
-                              <Chat roomId={room.id} />
+                        
+                        <TabsContent value="queue" className="mt-4">
+                            <Queue roomId={room.id} queue={room.queue} isOwner={isOwner} />
                           </TabsContent>
-                          <TabsContent value="ai-dj" className="h-full mt-0">
+                        
+                        <TabsContent value="social" className="mt-4">
+                            {/* AI DJ and Chat Toggle - FIXED to actually work */}
+                            <div className="space-y-4">
+                                <div className="flex items-center justify-between">
+                                    <h3 className="font-headline text-lg font-semibold">Social Hub</h3>
+                                    <div className="flex items-center gap-2 rounded-full border border-primary/20 p-1">
+                                        <button
+                                            onClick={() => handleSocialViewChange('ai-dj')}
+                                            className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                                socialView === 'ai-dj' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                            }`}
+                                        >
+                                            AI DJ
+                                        </button>
+                                        <button
+                                            onClick={() => handleSocialViewChange('chat')}
+                                            className={`px-3 py-1 text-xs rounded-full transition-colors font-medium ${
+                                            socialView === 'chat' ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:bg-muted/30'
+                                            }`}
+                                        >
+                                            Chat
+                                        </button>
+                                    </div>
+                                </div>
+                                
+                                {/* Conditional rendering based on social view - FIXED */}
+                                {socialView === 'ai-dj' ? (
+                                    <div className="space-y-4">
                               <AiDjPanel 
                                 roomHistory={roomHistory} 
-                                currentTrack={playingTrack ? {
-                                    videoId: playingTrack.videoId,
-                                    title: playingTrack.title
-                                } : undefined} 
+                                            currentTrack={playingTrack || undefined} // Pass undefined instead of null
                                 roomId={room.id} 
                               />
+                                    </div>
+                                ) : (
+                                    <div className="space-y-4">
+                                        <Chat roomId={room.id} />
+                                    </div>
+                                )}
+                            </div>
                           </TabsContent>
-                          <TabsContent value="game" className="h-full mt-0">
+                        
+                        <TabsContent value="games" className="mt-4">
                               <GameLobby 
                                 roomId={room.id} 
                                 activeGame={activeGame} 
-                                onGameStart={(gameId) => setActiveGame({ gameId, players: [] })}
+                                onGameStart={handleGameStart} // Corrected type for setActiveGame
                               />
                           </TabsContent>
-                        </div>
                     </Tabs>
                 </div>
             </div>
+
+            {/* Notifications */}
+            <Notifications roomId={room.id} />
         </div>
     );
 }

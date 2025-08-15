@@ -1,5 +1,6 @@
 import useWebSocket, { ReadyState } from 'react-use-websocket';
 import { useEffect, useState } from 'react';
+import { WebSocketMessage } from '@/lib/types';
 
 const WS_URL = 'ws://127.0.0.1:8000';
 
@@ -19,7 +20,7 @@ export function useSocket(username: string | undefined, roomId: string | undefin
         }
     }, [username, roomId]);
 
-    const { sendJsonMessage, lastJsonMessage, readyState } = useWebSocket(
+    const { sendJsonMessage, lastJsonMessage, readyState } = useWebSocket<WebSocketMessage>(
         socketUrl,
         {
             share: false,

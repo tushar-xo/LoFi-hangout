@@ -1,7 +1,7 @@
 
 'use client';
 
-import { useState } from 'react';
+import { useState, useMemo, memo } from 'react';
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -18,25 +18,36 @@ interface QueueProps {
   isOwner: boolean;
 }
 
-export default function Queue({ roomId, queue, isOwner }: QueueProps) {
+// Memoize the Queue component to prevent unnecessary re-renders
+const Queue = memo(function Queue({ roomId, queue, isOwner }: QueueProps) {
   const [youTubeUrl, setYouTubeUrl] = useState('');
   const [isAdding, setIsAdding] = useState(false);
   const { user } = useAuth();
   const { toast } = useToast();
 
-  console.log('Queue component - isOwner:', isOwner, 'user:', user?.uid);
+  // Memoize expensive computations to prevent recalculation on every render
+  const { sortedQueue, playingTrack, upcomingTracks } = useMemo(() => {
+    // Sort tracks purely by score (upvotes - downvotes) - no manual ordering
+    const sorted = [...queue].sort((a, b) => {
+      const scoreA = a.upvotes.length - a.downvotes.length;
+      const scoreB = b.upvotes.length - b.downvotes.length;
+      return scoreB - scoreA; // Higher scores first
+    });
 
-  // Sort tracks purely by score (upvotes - downvotes) - no manual ordering
-  const sortedQueue = [...queue].sort((a, b) => {
-    const scoreA = a.upvotes.length - a.downvotes.length;
-    const scoreB = b.upvotes.length - b.downvotes.length;
-    return scoreB - scoreA; // Higher scores first
-  });
+    const playing = sorted.find(t => t.status === 'playing');
+    const upcoming = sorted.filter(t => t.status === 'queued');
 
-  const playingTrack = sortedQueue.find(t => t.status === 'playing');
-  const upcomingTracks = sortedQueue.filter(t => t.status === 'queued');
+    return { sortedQueue: sorted, playingTrack: playing, upcomingTracks: upcoming };
+  }, [queue]); // Only recalculate when queue changes
 
-  console.log('Queue tracks - playing:', playingTrack?.title, 'upcoming:', upcomingTracks.length);
+  // Memoize the user ID to prevent unnecessary re-renders
+  const userId = useMemo(() => user?.uid, [user?.uid]);
+
+  // Only log when actually debugging (remove in production)
+  if (process.env.NODE_ENV === 'development') {
+    console.log('Queue component - isOwner:', isOwner, 'user:', userId);
+    console.log('Queue tracks - playing:', playingTrack?.title, 'upcoming:', upcomingTracks.length);
+  }
 
   const handleAddTrack = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -63,43 +74,43 @@ export default function Queue({ roomId, queue, isOwner }: QueueProps) {
   };
 
   return (
-    <div className="flex flex-col h-full p-6 space-y-6">
+    <div className="space-y-4">
       {/* Add Song Form */}
-      <form onSubmit={handleAddTrack} className="flex w-full items-center space-x-3 px-2">
+      <form onSubmit={handleAddTrack} className="flex w-full items-center space-x-2">
         <Input 
           type="text" 
           placeholder="Paste a YouTube link..." 
-          className="flex-1 bg-background/70 border-2 border-border/50 focus:border-primary/50 transition-colors"
+          className="flex-1 bg-background/70 border-2 border-border/50 focus:border-primary/50 transition-colors text-sm"
           value={youTubeUrl}
           onChange={(e) => setYouTubeUrl(e.target.value)}
           disabled={isAdding}
         />
-        <Button type="submit" size="icon" disabled={isAdding || !youTubeUrl} className="h-11 w-11">
-          {isAdding ? <Loader2 className="h-5 w-5 animate-spin" /> : <PlusCircle className="h-5 w-5" />}
+        <Button type="submit" size="icon" disabled={isAdding || !youTubeUrl} className="h-10 w-10">
+          {isAdding ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlusCircle className="h-4 w-4" />}
         </Button>
       </form>
 
       {/* Now Playing */}
       {playingTrack && (
-        <div className="px-2">
-            <h3 className="font-headline text-xl font-bold mb-4 text-foreground">Now Playing</h3>
+        <div>
+            <h3 className="font-headline text-lg font-bold mb-3 text-foreground">Now Playing</h3>
             <QueueItem roomId={roomId} track={playingTrack} isPlaying={true} isOwner={isOwner} />
         </div>
       )}
 
       {/* Upcoming Queue */}
-      <div className="flex-grow flex flex-col min-h-0">
-        <div className="flex items-center justify-between px-2 mb-4">
-          <h3 className="font-headline text-xl font-bold text-foreground">Up Next ({upcomingTracks.length})</h3>
-          <div className="text-sm text-muted-foreground bg-muted/50 px-3 py-1 rounded-full">
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <h3 className="font-headline text-lg font-bold text-foreground">Up Next ({upcomingTracks.length})</h3>
+          <div className="text-xs text-muted-foreground bg-muted/50 px-2 py-1 rounded-full">
             <span><span className="text-green-500 font-semibold">↑</span> <span className="text-red-500 font-semibold">↓</span> Vote to Reorder!</span>
           </div>
         </div>
-        <ScrollArea className="flex-grow pr-2">
+        <ScrollArea className="h-96">
           <div className="space-y-3">
             {upcomingTracks.map((track) => (
               <QueueItem 
-                key={`queue-${track.id}`} 
+                key={track.id} 
                 roomId={roomId} 
                 track={track} 
                 isPlaying={false} 
@@ -111,4 +122,6 @@ export default function Queue({ roomId, queue, isOwner }: QueueProps) {
       </div>
     </div>
   );
-}
+});
+
+export default Queue;

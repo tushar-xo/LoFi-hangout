@@ -79,34 +79,48 @@ export async function createRoom(name: string, user: { uid: string, displayName:
         throw new Error("You must be logged in to create a room.");
     }
     
-    // Create a simple user object without circular references
-    const userProfile: User = {
-        id: user.uid,
-        name: user.displayName || 'Anonymous',
-        avatarUrl: user.photoURL || `https://placehold.co/100x100.png`
-    };
-
-    // Create a simple room object without circular references
-    const newRoomData = {
-        name,
-        slug: createSlug(name),
-        isPrivate: false,
-        imageUrl: `https://placehold.co/400x200/A892EE/28282B.png`,
-        members: [userProfile],
-        queue: [],
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        currentPlayback: null, // Initialize as null to avoid undefined issues
-        ownerId: user.uid,
-        totalMembers: 1,
-    };
-    const docRef = await adminDb.collection("rooms").add(newRoomData);
-
-    const newRoomDoc = await docRef.get();
-    if (!newRoomDoc.exists) {
-        throw new Error("Failed to create room.");
+    if (!adminDb) {
+        throw new Error("Database connection not available. Please try again later.");
     }
+    
+    try {
+        // Create a simple user object without circular references
+        const userProfile: User = {
+            id: user.uid,
+            name: user.displayName || 'Anonymous',
+            avatarUrl: user.photoURL || `https://placehold.co/100x100.png`
+        };
 
-    return docToType<Room>(newRoomDoc);
+        // Create a simple room object without circular references
+        const newRoomData = {
+            name,
+            slug: createSlug(name),
+            isPrivate: false,
+            imageUrl: `https://placehold.co/400x200/A892EE/28282B.png`,
+            members: [userProfile],
+            queue: [],
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            currentPlayback: null, // Initialize as null to avoid undefined issues
+            ownerId: user.uid,
+            totalMembers: 1,
+        };
+        
+        const docRef = await adminDb.collection("rooms").add(newRoomData);
+
+        const newRoomDoc = await docRef.get();
+        if (!newRoomDoc.exists) {
+            throw new Error("Failed to create room.");
+        }
+
+        return docToType<Room>(newRoomDoc);
+    } catch (error) {
+        console.error('Error creating room:', error);
+        if (error instanceof Error) {
+            throw new Error(`Failed to create room: ${error.message}`);
+        } else {
+            throw new Error('Failed to create room. Please try again.');
+        }
+    }
 }
 
 // Function to play the next track in the queue

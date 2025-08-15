@@ -1,1210 +1,833 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, memo, useCallback } from 'react';
 import { Card, CardContent } from "@/components/ui/card";
-import type { Track, Room } from "@/lib/types";
-import { Music, Play, Pause, Fullscreen } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import type { Track } from "@/lib/types";
+import { Music, Play, Pause, Maximize, Minimize, PlayCircle, Loader2 } from "lucide-react";
 import { playNextTrackInQueue, sendNotificationToRoom } from '@/lib/firebase-client-service';
 import { Slider } from '@/components/ui/slider';
 import { useSocket } from '@/hooks/use-socket';
 import { useAuth } from '@/hooks/use-auth';
+import { useToast } from '@/hooks/use-toast';
 
 interface VideoPlayerProps {
     track: Track | undefined;
     roomId: string;
     isOwner: boolean;
+    queue?: Track[]; // Add queue prop to check for available tracks
 }
 
-export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps) {
-    const playerRef = useRef<YT.Player | null>(null);
-    const lastSyncRef = useRef({ time: 0, playing: false, lastSyncTime: 0 });
-    const lastMessageRef = useRef<string>('');
-    const [isApiReady, setIsApiReady] = useState(false);
+// Constants for video synchronization
+const SYNC_THRESHOLD = 2.0; // 2 seconds - sync if difference is greater than this
+const SYNC_INTERVAL = 2000; // 2 seconds - how often admin sends sync messages
+const STATE_REQUEST_INTERVAL = 3000; // 3 seconds - how often non-admins request state
+
+const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = [] }: VideoPlayerProps) {
+    // Refs for YouTube player and sync management
+    const playerRef = useRef<any | null>(null); // YouTube player type
+    const lastSyncTimeRef = useRef<number>(0);
+    const isApiReady = useRef<boolean>(false);
+    const isSyncingRef = useRef<boolean>(false);
+    const prevIsOwnerRef = useRef<boolean>(isOwner);
+    
+    // Component state
     const [playerReady, setPlayerReady] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [progress, setProgress] = useState(0);
     const [duration, setDuration] = useState(0);
+    const [syncStatus, setSyncStatus] = useState<'connected' | 'syncing' | 'disconnected'>('disconnected');
     const [isFullscreen, setIsFullscreen] = useState(false);
-    const [lastMessageId, setLastMessageId] = useState(0); // Force effect to run
+    const [memberPaused, setMemberPaused] = useState(false); // Track if member manually paused
+    
     const { user } = useAuth();
     const { sendJsonMessage, lastJsonMessage, readyState } = useSocket(user?.uid || 'Anonymous', roomId);
+    const { toast } = useToast();
 
-    console.log('VideoPlayer render:', { 
-        isOwner, 
-        playerReady, 
-        readyState, 
-        hasUser: !!user?.uid,
-        hasLastJsonMessage: !!lastJsonMessage,
-        lastJsonMessage,
-        WebSocketReadyState: readyState
-    });
-
-    // Load YouTube IFrame API
+    // Update sync status based on WebSocket connection
     useEffect(() => {
-        if (!window.YT) {
-            const tag = document.createElement('script');
-            tag.src = 'https://www.youtube.com/iframe_api';
-            const firstScriptTag = document.getElementsByTagName('script')[0];
-            firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
-            window.onYouTubeIframeAPIReady = () => setIsApiReady(true);
+        if (readyState === 1) {
+            setSyncStatus('connected');
         } else {
-            setIsApiReady(true);
+            setSyncStatus('disconnected');
         }
+    }, [readyState]);
 
-        // Add fullscreen change listeners
+    // Fullscreen event listeners
+    useEffect(() => {
         const handleFullscreenChange = () => {
             setIsFullscreen(!!document.fullscreenElement);
-        };
-
-        // Add keyboard shortcut for fullscreen (Escape key)
-        const handleKeyDown = (e: KeyboardEvent) => {
-            if (e.key === 'Escape' && isFullscreen) {
-                handleFullscreen();
-            }
         };
 
         document.addEventListener('fullscreenchange', handleFullscreenChange);
         document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
         document.addEventListener('mozfullscreenchange', handleFullscreenChange);
         document.addEventListener('MSFullscreenChange', handleFullscreenChange);
-        document.addEventListener('keydown', handleKeyDown);
 
         return () => {
-            if (playerRef.current) {
-                playerRef.current.destroy();
-                playerRef.current = null;
-            }
-            
-            // Clean up fullscreen listeners
             document.removeEventListener('fullscreenchange', handleFullscreenChange);
             document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
             document.removeEventListener('mozfullscreenchange', handleFullscreenChange);
             document.removeEventListener('MSFullscreenChange', handleFullscreenChange);
-            document.removeEventListener('keydown', handleKeyDown);
+        };
+    }, []);
+
+    // Utility function to validate currentTime
+    const isValidTime = useCallback((time: number): boolean => {
+        return typeof time === 'number' && !isNaN(time) && isFinite(time) && time >= 0;
+    }, []);
+
+    // Utility function to check if player is ready for operations
+    const isPlayerReady = useCallback((): boolean => {
+        return !!(
+            playerRef.current &&
+            playerReady &&
+            typeof playerRef.current.getCurrentTime === 'function' &&
+            typeof playerRef.current.seekTo === 'function' &&
+            typeof playerRef.current.getPlayerState === 'function' &&
+            typeof playerRef.current.getDuration === 'function'
+        );
+    }, [playerReady]);
+
+    // Load YouTube IFrame API
+    useEffect(() => {
+        const loadYouTubeAPI = () => {
+            if (window.YT && window.YT.Player) {
+                console.log('YouTube API already loaded');
+                isApiReady.current = true;
+                return;
+            }
+
+            if (document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+                // Script is already loading, wait for it
+                const checkAPI = () => {
+                    if (window.YT && window.YT.Player) {
+                        console.log('YouTube API loaded');
+                        isApiReady.current = true;
+                    } else {
+                        setTimeout(checkAPI, 100);
+                    }
+                };
+                checkAPI();
+                return;
+            }
+
+            // Load the YouTube API script
+            const tag = document.createElement('script');
+            tag.src = 'https://www.youtube.com/iframe_api';
+            tag.async = true;
+            
+            const firstScriptTag = document.getElementsByTagName('script')[0];
+            firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+            
+            // Set up global callback
+            (window as any).onYouTubeIframeAPIReady = () => {
+                console.log('YouTube API ready via callback');
+                isApiReady.current = true;
+            };
+            
+            // Fallback polling in case callback doesn't fire
+            const checkAPI = () => {
+                if (window.YT && window.YT.Player) {
+                    console.log('YouTube API ready via polling');
+                    isApiReady.current = true;
+                } else {
+                    setTimeout(checkAPI, 100);
+                }
+            };
+            setTimeout(checkAPI, 1000);
+        };
+
+        loadYouTubeAPI();
+
+        return () => {
+            if (playerRef.current) {
+                try {
+                    playerRef.current.destroy();
+                    console.log('Player destroyed on cleanup');
+                } catch (e) {
+                    console.warn('Error destroying player:', e);
+                }
+                playerRef.current = null;
+            }
         };
     }, []);
 
     // Initialize or update player when track changes
     useEffect(() => {
+        // Reset member pause state when track changes
+        setMemberPaused(false);
+        
         if (!track) {
             if (playerRef.current && playerReady) {
-                (playerRef.current as any).stopVideo();
+                try {
+                    playerRef.current.stopVideo();
+                } catch (e) {
+                    console.warn('Error stopping video:', e);
+                }
             }
             return;
         }
 
-        if (isApiReady) {
-            if (playerRef.current) {
-                (playerRef.current as any).loadVideoById(track.videoId);
-                // Send sync when track changes
-                if (isOwner) {
-                    setTimeout(() => {
-                        if (playerRef.current && playerReady) {
-                            const currentTime = (playerRef.current as any).getCurrentTime();
-                            const message = { type: 'playbackState', isPlaying: true, currentTime };
-                            sendJsonMessage(message);
-                            lastMessageRef.current = JSON.stringify(message);
-                            console.log('Track change sync sent:', message);
-                        }
-                    }, 1000); // Wait 1 second for player to load
+        if (isApiReady.current) {
+            if (playerRef.current && typeof playerRef.current.loadVideoById === 'function') {
+                try {
+                    // Load new video
+                    playerRef.current.loadVideoById(track.videoId);
+                    
+                    // Admin sends initial sync when track changes
+                    if (isOwner) {
+                        setTimeout(() => {
+                            if (isPlayerReady()) {
+                                const currentTime = playerRef.current!.getCurrentTime();
+                                const message = { 
+                                    type: 'playbackState', 
+                                    isPlaying: true, 
+                                    currentTime,
+                                    adminId: user?.uid 
+                                };
+                                sendJsonMessage(message);
+                                console.log('Track change sync sent:', message);
+                            }
+                        }, 1000);
+                    }
+                } catch (error) {
+                    console.warn('Error loading video:', error);
+                    // Fallback: recreate player if loadVideoById fails
+                    playerRef.current = null;
                 }
             } else {
+                // Create new player
                 playerRef.current = new (window as any).YT.Player('youtube-player', {
                     videoId: track.videoId,
+                    width: '100%',
+                    height: '100%',
                     playerVars: {
-                        autoplay: 1,
-                        controls: 0, // Hide YouTube controls to prevent syncing issues
+                        autoplay: isOwner ? 1 : 0, // Only auto-play for admin
+                        controls: isOwner ? 1 : 0, // Show YouTube controls only for admin
                         modestbranding: 1,
                         rel: 0,
-                        showinfo: 0, // Hide video info
-                        fs: 0, // Disable fullscreen button
-                        playsinline: 1,
-                        iv_load_policy: 3, // Show video annotations
-                        color: 'white', // Player color
-                        enablejsapi: 1, // Enable JavaScript API
-                        origin: window.location.origin, // Set origin for security
+                        showinfo: 0,
+                        fs: 1, // Enable fullscreen
+                        playsinline: 1, // Important for mobile
+                        iv_load_policy: 3,
+                        color: 'white',
+                        enablejsapi: 1,
+                        origin: window.location.origin,
+                        // Mobile-specific parameters
+                        cc_load_policy: 0, // Disable closed captions by default
+                        disablekb: 0, // Enable keyboard controls
+                        end: undefined, // Don't set an end time
+                        hl: 'en', // Set interface language
+                        loop: 0, // Don't loop
+                        start: 0, // Start from beginning
+                        widget_referrer: window.location.origin
                     },
                     events: {
                         onReady: (event: any) => {
                             setPlayerReady(true);
-                            (event.target as any).playVideo();
-                            setDuration((event.target as any).getDuration());
+                            setDuration(event.target.getDuration());
+                            setProgress(event.target.getCurrentTime() || 0);
                             
-                            // Send initial sync when player is ready
                             if (isOwner) {
-                                const currentTime = (event.target as any).getCurrentTime();
-                                const message = { type: 'playbackState', isPlaying: true, currentTime };
-                                sendJsonMessage(message);
-                                lastMessageRef.current = JSON.stringify(message);
-                                console.log('Initial sync sent:', message);
+                                // Auto-play for admin
+                                event.target.playVideo();
+                                
+                                // Send initial sync
+                                setTimeout(() => {
+                                    const currentTime = event.target.getCurrentTime();
+                                    const message = { 
+                                        type: 'playbackState', 
+                                        isPlaying: true, 
+                                        currentTime,
+                                        adminId: user?.uid 
+                                    };
+                                    sendJsonMessage(message);
+                                }, 500);
                             }
                         },
                         onStateChange: (event: any) => {
-                            const wasPlaying = isPlaying;
-                            const newPlaying = event.data === (window as any).YT.PlayerState.PLAYING;
-                            setIsPlaying(newPlaying);
-                            
-                            // Send immediate sync when play state changes
-                            if (isOwner && wasPlaying !== newPlaying) {
-                                const currentTime = (event.target as any).getCurrentTime();
-                                const message = { type: 'playbackState', isPlaying: newPlaying, currentTime };
-                                sendJsonMessage(message);
-                                lastMessageRef.current = JSON.stringify(message);
-                                console.log('State change sync sent:', message);
-                            }
-                            
-                            // Auto-play next video when current one ends
-                            if (event.data === (window as any).YT.PlayerState.ENDED) {
-                                console.log('Video ended, auto-playing next track');
-                                // Send notification that next track is starting
+                            try {
+                                const playerState = event.data;
+                                const newPlaying = playerState === (window as any).YT.PlayerState.PLAYING;
+                                const newPaused = playerState === (window as any).YT.PlayerState.PAUSED;
+                                const wasPlaying = isPlaying;
+                                
+                                console.log('State change:', { playerState, newPlaying, wasPlaying, isOwner });
+                                
+                                // Always update the playing state immediately
+                                setIsPlaying(newPlaying);
+                                
+                                // Update progress and duration when state changes
+                                if (event.target && typeof event.target.getCurrentTime === 'function') {
+                                    const currentTime = event.target.getCurrentTime();
+                                    const videoDuration = event.target.getDuration();
+                                    
+                                    if (isValidTime(currentTime)) {
+                                        setProgress(currentTime);
+                                    }
+                                    if (videoDuration && videoDuration > 0 && isValidTime(videoDuration)) {
+                                        setDuration(videoDuration);
+                                    }
+                                }
+                                
+                                // Handle member manual pause/play detection (non-admin only)
+                                if (!isOwner && !isSyncingRef.current) {
+                                    if (newPaused && wasPlaying) {
+                                        console.log('Member manually paused video');
+                                        setMemberPaused(true);
+                                    } else if (newPlaying && !wasPlaying && memberPaused) {
+                                        console.log('Member manually resumed video, syncing back to admin');
+                                        setMemberPaused(false);
+                                        sendJsonMessage({ type: 'requestState', from: user?.uid });
+                                    }
+                                }
+                                
+                                // ADMIN: Send sync for ALL state changes (including YouTube control usage)
                                 if (isOwner) {
+                                    if (event.target && typeof event.target.getCurrentTime === 'function') {
+                                        const currentTime = event.target.getCurrentTime();
+                                        const message = { 
+                                            type: 'playbackState', 
+                                            isPlaying: newPlaying, 
+                                            currentTime,
+                                            adminId: user?.uid,
+                                            timestamp: Date.now(),
+                                            source: 'stateChange'
+                                        };
+                                        sendJsonMessage(message);
+                                        console.log('Admin sync sent:', message);
+                                        lastSyncTimeRef.current = Date.now();
+                                    }
+                                }
+                                
+                                // Auto-play next video when current one ends (admin only)
+                                if (playerState === (window as any).YT.PlayerState.ENDED && isOwner) {
+                                    console.log('Video ended, auto-playing next track');
                                     sendJsonMessage({ 
                                         type: 'trackEnded', 
-                                        message: 'Current track ended, starting next track...' 
+                                        message: 'Current track ended, starting next track...',
+                                        adminId: user?.uid 
                                     });
+                                    playNextTrackInQueue(roomId);
                                 }
-                                playNextTrackInQueue(roomId);
+                            } catch (error) {
+                                console.error('Error in onStateChange:', error);
                             }
                         }
                     }
                 });
             }
         }
-    }, [track?.id, roomId, isApiReady]);
+    }, [track?.id, roomId, isOwner, user?.uid, sendJsonMessage]);
 
-    // Sync video state when player becomes ready (for non-owners)
+    // Handle admin control transfer - reinitialize YouTube player when isOwner changes
     useEffect(() => {
-        if (playerReady && !isOwner && playerRef.current) {
-            // Request current state from owner immediately
-            console.log('Non-owner requesting initial state from owner');
-            sendJsonMessage({ type: 'requestState' });
-            
-            // Set up more frequent sync requests for better synchronization
-            const syncInterval = setInterval(() => {
-                if (playerRef.current && playerReady) {
-                    console.log('Non-owner sending periodic sync request');
-                    sendJsonMessage({ type: 'requestState' });
-                }
-            }, 1500); // Request sync every 1.5 seconds for better sync
-            
-            // Force sync with last received message every 2 seconds
-            const forceSyncInterval = setInterval(() => {
-                if (playerRef.current && playerReady && lastJsonMessage && (lastJsonMessage as any).type === 'playbackState') {
-                    console.log('Force sync interval triggered, processing last message');
-                    processWebSocketMessage(lastJsonMessage);
-                }
-            }, 2000);
-            
-            return () => {
-                clearInterval(syncInterval);
-                clearInterval(forceSyncInterval);
-            };
-        }
-    }, [playerReady, isOwner, sendJsonMessage, lastJsonMessage]);
-
-    // Test WebSocket connection when component mounts
-    useEffect(() => {
-        if (readyState === 1 && user?.uid) { // WebSocket is open
-            console.log('Testing WebSocket connection...');
-            // Send a test message to verify connection
-            sendJsonMessage({ type: 'test', message: 'Video player test message' });
-        }
-    }, [readyState, user?.uid, sendJsonMessage]);
-
-    // Direct WebSocket message listener as fallback
-    useEffect(() => {
-        const handleWebSocketMessage = (event: MessageEvent) => {
-            try {
-                const data = JSON.parse(event.data);
-                console.log('Direct WebSocket message received:', data);
-                
-                if (data.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                    console.log('Direct WebSocket processing playbackState message');
-                    processWebSocketMessage(data);
-                }
-            } catch (error) {
-                console.warn('Error parsing direct WebSocket message:', error);
-            }
-        };
-        
-        // Add event listener to the WebSocket if available
-        if (typeof window !== 'undefined' && window.WebSocket) {
-            // Try to find the WebSocket instance
-            const wsInstances = document.querySelectorAll('script[src*="websocket"]');
-            console.log('Found WebSocket instances:', wsInstances.length);
-            
-            // Add global message listener
-            window.addEventListener('message', (event) => {
-                if (event.data && typeof event.data === 'string' && event.data.includes('playbackState')) {
-                    try {
-                        const data = JSON.parse(event.data);
-                        if (data.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                            console.log('Global message listener processing playbackState');
-                            processWebSocketMessage(data);
-                        }
-                    } catch (error) {
-                        // Ignore parsing errors
-                    }
-                }
-            });
-        }
-        
-        return () => {
-            window.removeEventListener('message', handleWebSocketMessage);
-        };
-    }, [isOwner, playerReady]);
-
-    // Custom event listener for WebSocket messages
-    useEffect(() => {
-        const handleCustomMessage = (event: CustomEvent) => {
-            if (event.detail && event.detail.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                console.log('Custom event listener processing playbackState message');
-                processWebSocketMessage(event.detail);
-            }
-        };
-        
-        // Listen for custom WebSocket message events
-        window.addEventListener('websocket-message', handleCustomMessage as EventListener);
-        
-        return () => {
-            window.removeEventListener('websocket-message', handleCustomMessage as EventListener);
-        };
-    }, [isOwner, playerReady]);
-
-    // DOM-based message detection using mutation observer
-    useEffect(() => {
-        if (!isOwner || !playerReady) return;
-        
-        const observer = new MutationObserver((mutations) => {
-            mutations.forEach((mutation) => {
-                if (mutation.type === 'childList') {
-                    mutation.addedNodes.forEach((node) => {
-                        if (node.nodeType === Node.TEXT_NODE && node.textContent) {
-                            const text = node.textContent;
-                            if (text.includes('playbackState') && text.includes('currentTime')) {
-                                try {
-                                    const data = JSON.parse(text);
-                                    if (data.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                                        console.log('Mutation observer detected playbackState message');
-                                        processWebSocketMessage(data);
-                                    }
-                                } catch (error) {
-                                    // Ignore parsing errors
-                                }
-                            }
-                        }
-                    });
-                }
-            });
-        });
-        
-        // Observe the entire document for text changes
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true
-        });
-        
-        return () => {
-            observer.disconnect();
-        };
-    }, [isOwner, playerReady]);
-
-    // Console log interceptor to catch WebSocket messages
-    useEffect(() => {
-        if (!isOwner || !playerReady) return;
-        
-        const originalLog = console.log;
-        const originalWarn = console.warn;
-        const originalError = console.error;
-        
-        console.log = (...args) => {
-            originalLog.apply(console, args);
-            
-            // Check if any of the logged messages contain WebSocket data
-            args.forEach((arg) => {
-                if (typeof arg === 'string' && arg.includes('playbackState') && arg.includes('currentTime')) {
-                    try {
-                        const data = JSON.parse(arg);
-                        if (data.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                            console.log('Console interceptor detected playbackState message');
-                            processWebSocketMessage(data);
-                        }
-                    } catch (error) {
-                        // Ignore parsing errors
-                    }
-                }
-            });
-        };
-        
-        console.warn = (...args) => {
-            originalWarn.apply(console, args);
-            
-            // Check if any of the logged messages contain WebSocket data
-            args.forEach((arg) => {
-                if (typeof arg === 'string' && arg.includes('playbackState') && arg.includes('currentTime')) {
-                    try {
-                        const data = JSON.parse(arg);
-                        if (data.type === 'playbackState' && !isOwner && playerReady && playerRef.current) {
-                            console.log('Console interceptor detected playbackState message from warn');
-                            processWebSocketMessage(data);
-                        }
-                    } catch (error) {
-                        // Ignore parsing errors
-                    }
-                }
-            });
-        };
-        
-        return () => {
-            console.log = originalLog;
-            console.warn = originalWarn;
-            console.error = originalError;
-        };
-    }, [isOwner, playerReady]);
-
-    // Direct message polling as final fallback
-    useEffect(() => {
-        if (!isOwner || !playerReady) return;
-        
-        let lastProcessedMessage = '';
-        
-        const pollInterval = setInterval(() => {
-            if (lastJsonMessage) {
-                const messageStr = JSON.stringify(lastJsonMessage);
-                if (messageStr !== lastProcessedMessage) {
-                    console.log('Polling detected new message:', lastJsonMessage);
-                    lastProcessedMessage = messageStr;
-                    processWebSocketMessage(lastJsonMessage);
-                }
-            }
-        }, 1000); // Check every second
-        
-        return () => {
-            clearInterval(pollInterval);
-        };
-    }, [isOwner, playerReady, lastJsonMessage]);
-
-    // Force sync effect to run when new messages arrive
-    useEffect(() => {
-        if (lastJsonMessage) {
-            console.log('New message received, updating message ID to force sync effect');
-            setLastMessageId(prev => prev + 1);
-            
-            // Process message immediately instead of waiting for effect
-            console.log('Processing message immediately:', lastJsonMessage);
-            processWebSocketMessage(lastJsonMessage);
-        }
-    }, [lastJsonMessage]);
-    
-    // Separate effect to ensure sync processing runs
-    useEffect(() => {
-        if (lastJsonMessage && !isOwner && playerReady && playerRef.current) {
-            console.log('Separate sync effect triggered for message:', lastJsonMessage);
-            processWebSocketMessage(lastJsonMessage);
-        }
-    }, [lastJsonMessage, isOwner, playerReady]);
-    
-    // Direct message processing function
-    const processWebSocketMessage = (message: any) => {
-        console.log('Direct message processing:', message);
-        
-        if (!message || !playerRef.current || !playerReady) {
-            console.log('Cannot process message - player not ready');
+        // Only proceed if isOwner has actually changed (not on initial mount)
+        if (prevIsOwnerRef.current === isOwner) {
+            prevIsOwnerRef.current = isOwner;
             return;
         }
-        
-        // Handle incoming sync messages (for non-owners)
-        if (!isOwner && message.type === 'playbackState') {
-            console.log('Non-owner processing sync message directly:', message);
-            processPlaybackStateMessage(message);
-        }
-    };
-    
-    // Process playback state messages
-    const processPlaybackStateMessage = (message: any) => {
-        const { isPlaying, currentTime } = message;
-        console.log(`Direct processing: isPlaying=${isPlaying}, currentTime=${currentTime}`);
-        
-        // Validate currentTime value
-        if (typeof currentTime !== 'number' || isNaN(currentTime) || currentTime < 0) {
-            console.warn('Invalid currentTime received:', currentTime);
-            return;
-        }
-        
+
+        prevIsOwnerRef.current = isOwner;
+
+        if (!isApiReady.current || !track?.videoId || !playerRef.current) return;
+
+        console.log('Admin control transfer detected, reinitializing player with controls:', isOwner);
+
         const player = playerRef.current;
-        if (!player) {
-            console.warn('Player ref not available');
+        let currentTime = 0;
+        let isCurrentlyPlaying = false;
+
+        try {
+            // Safely get current state
+            if (typeof player.getCurrentTime === 'function' && typeof player.getPlayerState === 'function') {
+                currentTime = player.getCurrentTime() || 0;
+                isCurrentlyPlaying = player.getPlayerState() === (window as any).YT.PlayerState.PLAYING;
+            }
+        } catch (error) {
+            console.warn('Error getting player state during transfer:', error);
+        }
+
+        // Destroy and recreate player with new controls
+        try {
+            player.destroy();
+        } catch (error) {
+            console.warn('Error destroying player:', error);
+        }
+        
+        setPlayerReady(false); // Mark as not ready during transfer
+        
+        // Small delay to ensure player is properly destroyed
+        setTimeout(() => {
+            playerRef.current = new (window as any).YT.Player('youtube-player', {
+                videoId: track.videoId,
+                width: '100%',
+                height: '100%',
+                playerVars: {
+                    autoplay: 0, // Don't auto-play during control transfer
+                    controls: isOwner ? 1 : 0, // Show YouTube controls only for new admin
+                    modestbranding: 1,
+                    rel: 0,
+                    showinfo: 0,
+                    fs: 1,
+                    playsinline: 1,
+                    iv_load_policy: 3,
+                    color: 'white',
+                    enablejsapi: 1,
+                    origin: window.location.origin,
+                    cc_load_policy: 0,
+                    disablekb: 0,
+                    end: undefined,
+                    hl: 'en',
+                    loop: 0,
+                    start: Math.floor(currentTime), // Resume from current position
+                    widget_referrer: window.location.origin
+                },
+                events: {
+                    onReady: (event: any) => {
+                        setPlayerReady(true);
+                        setDuration(event.target.getDuration());
+                        
+                        // Seek to the correct time and restore playback state
+                        event.target.seekTo(currentTime, true);
+                        if (isCurrentlyPlaying) {
+                            event.target.playVideo();
+                        } else {
+                            event.target.pauseVideo();
+                        }
+                        
+                        setProgress(currentTime);
+                        
+                        // Send sync message if new admin
+                        if (isOwner) {
+                            setTimeout(() => {
+                                const message = { 
+                                    type: 'playbackState', 
+                                    isPlaying: isCurrentlyPlaying, 
+                                    currentTime,
+                                    adminId: user?.uid,
+                                    timestamp: Date.now(),
+                                    source: 'adminTransfer'
+                                };
+                                sendJsonMessage(message);
+                                console.log('Admin transfer sync sent:', message);
+                            }, 500);
+                        }
+                    },
+                    onStateChange: (event: any) => {
+                        const playerState = event.data;
+                        const currentTime = event.target.getCurrentTime();
+                        
+                        try {
+                            // Update progress for all users
+                            if (isValidTime(currentTime)) {
+                                setProgress(currentTime);
+                            }
+
+                            // Only admin should send sync messages
+                            if (isOwner) {
+                                const isCurrentlyPlaying = playerState === (window as any).YT.PlayerState.PLAYING;
+                                setIsPlaying(isCurrentlyPlaying);
+                                
+                                // Send sync message for state changes
+                                if (user?.uid) {
+                                    const message = { 
+                                        type: 'playbackState', 
+                                        isPlaying: isCurrentlyPlaying, 
+                                        currentTime,
+                                        adminId: user?.uid,
+                                        timestamp: Date.now(),
+                                        source: 'stateChange'
+                                    };
+                                    sendJsonMessage(message);
+                                    lastSyncTimeRef.current = Date.now();
+                                }
+                            }
+                            
+                            // Auto-play next video when current one ends (admin only)
+                            if (playerState === (window as any).YT.PlayerState.ENDED && isOwner) {
+                                sendJsonMessage({ 
+                                    type: 'trackEnded', 
+                                    message: 'Current track ended, starting next track...',
+                                    adminId: user?.uid 
+                                });
+                                playNextTrackInQueue(roomId);
+                            }
+                        } catch (error) {
+                            console.error('Error in onStateChange after transfer:', error);
+                        }
+                    }
+                }
+            });
+        }, 100);
+    }, [isOwner]); // Only trigger when isOwner changes
+
+    // Sync function for non-admins
+    const syncWithAdmin = useCallback((targetTime: number, targetPlaying: boolean) => {
+        if (!isPlayerReady() || isSyncingRef.current || !isValidTime(targetTime)) {
+            console.log('Sync skipped:', { ready: isPlayerReady(), syncing: isSyncingRef.current, valid: isValidTime(targetTime) });
             return;
         }
-        
-        // Simple direct sync - try this first
+
         try {
-            console.log('Attempting direct sync to:', currentTime);
-            
-            // Get current position before seeking
-            const beforeSeek = player.getCurrentTime();
-            console.log(`Position before seek: ${beforeSeek}`);
-            
-            // Ensure video is playing before seeking
-            const currentPlayerState = player.getPlayerState();
-            if (currentPlayerState !== 1) { // Not playing
-                console.log('Video not playing, starting it first...');
-                player.playVideo();
+            isSyncingRef.current = true;
+            setSyncStatus('syncing');
+            const player = playerRef.current!;
+            const currentTime = player.getCurrentTime();
+            const currentState = player.getPlayerState();
+            const currentPlaying = currentState === 1;
+            const timeDiff = Math.abs(currentTime - targetTime);
+
+            console.log('Member sync check:', { 
+                currentTime: currentTime.toFixed(1), 
+                targetTime: targetTime.toFixed(1), 
+                timeDiff: timeDiff.toFixed(1), 
+                currentPlaying, 
+                targetPlaying,
+                memberPaused,
+                threshold: SYNC_THRESHOLD
+            });
+
+            // Only sync if difference is significant (> 2 seconds) or play state is different
+            if (timeDiff > SYNC_THRESHOLD || (currentPlaying !== targetPlaying && !memberPaused)) {
+                console.log(`Member syncing: ${timeDiff > SYNC_THRESHOLD ? 'TIME' : ''}${currentPlaying !== targetPlaying ? ' PLAY' : ''}`);
                 
-                // Wait a bit for video to start, then seek
-                setTimeout(() => {
-                    if (player) {
-                        console.log('Video started, now seeking...');
-                        player.seekTo(currentTime, true);
-                        console.log('Direct seek completed');
-                    }
-                }, 300);
-            } else {
-                player.seekTo(currentTime, true);
-                console.log('Direct seek completed');
-            }
-            
-            // Verify direct sync worked
-            setTimeout(() => {
-                if (player) {
-                    const afterSeek = player.getCurrentTime();
-                    const seekDiff = Math.abs(afterSeek - currentTime);
-                    console.log(`Direct sync result: target=${currentTime}, actual=${afterSeek}, diff=${seekDiff}`);
-                    
-                    if (seekDiff > 2) {
-                        console.warn('Direct sync failed, trying again...');
-                        player.seekTo(currentTime, true);
-                        
-                        // Try multiple times with different approaches
-                        setTimeout(() => {
-                            if (player) {
-                                console.log('Second attempt - pausing and resuming...');
-                                player.pauseVideo();
-                                setTimeout(() => {
-                                    if (player) {
-                                        player.seekTo(currentTime, true);
-                                        setTimeout(() => {
-                                            if (player) {
-                                                player.playVideo();
-                                            }
-                                        }, 100);
-                                    }
-                                }, 100);
-                            }
-                        }, 500);
-                    } else {
-                        console.log('Direct sync successful!');
-                    }
+                // Seek to the correct time first
+                if (timeDiff > SYNC_THRESHOLD) {
+                    player.seekTo(targetTime, true);
+                    setProgress(targetTime); // Update UI immediately
                 }
-            }, 500);
-            
-        } catch (error) {
-            console.warn('Direct sync failed:', error);
-            
-            // Final fallback - try to force sync by reloading the video
-            try {
-                console.log('Attempting fallback sync by reloading video...');
-                const currentVideoId = (player as any).getVideoData().video_id;
-                if (currentVideoId) {
-                    (player as any).loadVideoById(currentVideoId);
+
+                // Then handle play state - but only if member hasn't manually paused
+                if (targetPlaying !== currentPlaying && !memberPaused) {
                     setTimeout(() => {
-                        if (player) {
-                            (player as any).seekTo(currentTime, true);
-                            (player as any).playVideo();
-                        }
-                    }, 2000);
-                }
-            } catch (fallbackError) {
-                console.error('Fallback sync also failed:', fallbackError);
-            }
-        }
-    };
-
-    // WebSocket listener for playback state
-    useEffect(() => {
-        console.log('Video player WebSocket effect triggered:', { 
-            hasLastJsonMessage: !!lastJsonMessage, 
-            lastJsonMessage, 
-            isOwner, 
-            playerReady,
-            messageId: lastMessageId
-        });
-        
-        if (lastJsonMessage) {
-            const message = lastJsonMessage as any;
-            console.log('Video player received WebSocket message:', message);
-            
-            // Force trigger the sync logic if a specific message indicates a state change
-            // This is a workaround to ensure the sync logic runs even if the state hasn't changed
-            // based on the current logic. A more robust solution would involve a dedicated
-            // state change detection mechanism.
-            if (message.type === 'playbackState' && isOwner && playerRef.current && playerReady) {
-                console.log('Forcing sync due to playbackState message from owner.');
-                // This will trigger the sync logic, including seeking and play state updates.
-                // The original logic will then handle the specific state changes.
-            }
-
-            // Handle state requests from non-owners
-            if (message.type === 'requestState' && isOwner && playerRef.current && playerReady) {
-                try {
-                    const currentTime = playerRef.current.getCurrentTime();
-                    const response = { type: 'playbackState', isPlaying, currentTime };
-                    sendJsonMessage(response);
-                    console.log('Owner responding to state request:', response);
-                } catch (error) {
-                    console.warn('Error responding to state request:', error);
-                }
-                return;
-            }
-            
-            // Handle incoming sync messages (for non-owners)
-            if (!isOwner && playerRef.current && playerReady) {
-                console.log('Non-owner processing sync message:', message);
-                
-                // Comprehensive player readiness check
-                const player = playerRef.current;
-                const isPlayerReady = player && 
-                    typeof player.getCurrentTime === 'function' && 
-                    typeof player.seekTo === 'function' && 
-                    typeof player.getPlayerState === 'function' && 
-                    typeof player.getDuration === 'function';
-                
-                if (!isPlayerReady) {
-                    console.warn('Player not fully ready for sync operations');
-                    return;
-                }
-                
-                // Additional check: ensure YouTube API is fully loaded
-                if (typeof window.YT === 'undefined' || !window.YT.Player) {
-                    console.warn('YouTube API not fully loaded');
-                    return;
-                }
-                
-                // Check if video is actually loaded and ready
-                try {
-                    const testTime = player.getCurrentTime();
-                    const testDuration = player.getDuration();
-                    console.log(`Player readiness test: currentTime=${testTime}, duration=${testDuration}`);
-                    
-                    if (isNaN(testTime) || isNaN(testDuration) || testDuration <= 0) {
-                        console.warn('Player not fully initialized, test values invalid');
-                        return;
-                    }
-                } catch (error) {
-                    console.warn('Player readiness test failed:', error);
-                    return;
-                }
-                
-                console.log('Player is ready for sync operations');
-                
-                if (message.type === 'playbackState') {
-                    const { isPlaying, currentTime } = message;
-                    console.log(`Processing playbackState sync: isPlaying=${isPlaying}, currentTime=${currentTime}`);
-                    
-                    // Validate currentTime value
-                    if (typeof currentTime !== 'number' || isNaN(currentTime) || currentTime < 0) {
-                        console.warn('Invalid currentTime received:', currentTime);
-                        return;
-                    }
-                    
-                    // Check if video is actually loaded
-                    const videoDuration = player.getDuration();
-                    if (videoDuration <= 0) {
-                        console.warn('Video not loaded yet, duration is:', videoDuration);
-                        return;
-                    }
-                    
-                    // Check if seeking to currentTime would be valid
-                    if (currentTime > videoDuration) {
-                        console.warn(`Cannot seek to ${currentTime}, video duration is ${videoDuration}`);
-                        return;
-                    }
-                    
-                    console.log(`Video validation passed: duration=${videoDuration}, target=${currentTime}`);
-                    
-                    // Simple direct sync - try this first
-                    try {
-                        console.log('Attempting simple direct sync...');
-                        
-                        // Ensure video is playing before seeking
-                        const currentPlayerState = player.getPlayerState();
-                        if (currentPlayerState !== 1) { // Not playing
-                            console.log('Video not playing, starting it first...');
-                            player.playVideo();
-                            
-                            // Wait a bit for video to start, then seek
-                            setTimeout(() => {
-                                if (player) {
-                                    console.log('Video started, now seeking...');
-                                    player.seekTo(currentTime, true);
-                                }
-                            }, 300);
-                        } else {
-                            player.seekTo(currentTime, true);
-                        }
-                        
-                        console.log('Simple sync completed');
-                        
-                        // Verify simple sync worked
-                        setTimeout(() => {
-                            if (player) {
-                                const simpleSyncTime = player.getCurrentTime();
-                                const simpleSyncDiff = Math.abs(simpleSyncTime - currentTime);
-                                console.log(`Simple sync result: target=${currentTime}, actual=${simpleSyncTime}, diff=${simpleSyncDiff}`);
-                                
-                                // If simple sync failed, try again
-                                if (simpleSyncDiff > 2) {
-                                    console.warn('Simple sync failed, retrying...');
-                                    player.seekTo(currentTime, true);
-                                    
-                                    // Check again after retry
-                                    setTimeout(() => {
-                                        if (player) {
-                                            const retryTime = player.getCurrentTime();
-                                            const retryDiff = Math.abs(retryTime - currentTime);
-                                            console.log(`Retry sync result: target=${currentTime}, actual=${retryTime}, diff=${retryDiff}`);
-                                            
-                                            if (retryDiff > 2) {
-                                                console.error('Sync failed after retry');
-                                            } else {
-                                                console.log('Sync successful after retry');
-                                            }
-                                        }
-                                    }, 500);
-                                } else {
-                                    console.log('Sync successful');
-                                }
-                                
-                                // Monitor position for a few seconds to see if it stays in sync
-                                let checkCount = 0;
-                                const positionMonitor = setInterval(() => {
-                                    if (player && checkCount < 6) { // Monitor for 3 seconds
-                                        const monitorTime = player.getCurrentTime();
-                                        const monitorDiff = Math.abs(monitorTime - currentTime);
-                                        console.log(`Position monitor ${checkCount + 1}: target=${currentTime}, actual=${monitorTime}, diff=${monitorDiff}`);
-                                        
-                                        if (monitorDiff > 5) {
-                                            console.warn('Video drifted out of sync during monitoring');
-                                        }
-                                        
-                                        checkCount++;
-                                    } else {
-                                        clearInterval(positionMonitor);
-                                    }
-                                }, 500);
-                            }
-                        }, 500);
-                    } catch (error) {
-                        console.warn('Simple sync failed:', error);
-                    }
-                    
-                    try {
-                        const playerCurrentTime = playerRef.current.getCurrentTime();
-                        const timeDiff = Math.abs(playerCurrentTime - currentTime);
-                        console.log(`Sync check: player=${playerCurrentTime}, target=${currentTime}, diff=${timeDiff}`);
-                        
-                        // Force sync if significantly out of sync (more than 5 seconds)
-                        const forceSync = timeDiff > 5;
-                        
-                        // Always sync for debugging - remove this later
-                        const debugSync = true;
-                        
-                        // Sync if time difference is more than 0.5 seconds for better accuracy
-                        if (timeDiff > 0.5 || forceSync || debugSync) {
-                            if (forceSync) {
-                                console.log(`FORCE SYNC: Video significantly out of sync (${timeDiff}s), forcing seek to ${currentTime}`);
-                            } else if (debugSync) {
-                                console.log(`DEBUG SYNC: Always syncing for debugging, current=${playerCurrentTime}, target=${currentTime}, diff=${timeDiff}`);
+                        try {
+                            if (targetPlaying) {
+                                player.playVideo();
                             } else {
-                                console.log(`Syncing video: current=${playerCurrentTime}, target=${currentTime}`);
+                                player.pauseVideo();
                             }
-                            
-                            // Check if player is in a valid state for seeking
-                            const playerState = playerRef.current.getPlayerState();
-                            const videoDuration = playerRef.current.getDuration();
-                            
-                            console.log(`Player state check: state=${playerState}, duration=${videoDuration}, ready=${playerReady}`);
-                            
-                            // Ensure video is loaded and duration is available
-                            if (videoDuration <= 0) {
-                                console.log('Video not fully loaded yet, waiting...');
-                                setTimeout(() => {
-                                    if (playerRef.current && playerRef.current.getDuration() > 0) {
-                                        console.log('Video loaded, attempting seek...');
-                                        playerRef.current.seekTo(currentTime, true);
-                                    }
-                                }, 1000);
-                                return;
-                            }
-                            
-                            // Ensure video is playing before seeking (seeking works better when playing)
-                            const isCurrentlyPlaying = playerRef.current.getPlayerState() === 1;
-                            if (!isCurrentlyPlaying && isPlaying) {
-                                console.log('Starting video before seeking for better sync...');
-                                playerRef.current.playVideo();
-                                
-                                // Wait a bit for video to start, then seek
-                                setTimeout(() => {
-                                    if (playerRef.current) {
-                                        console.log('Video started, now seeking...');
-                                        playerRef.current.seekTo(currentTime, true);
-                                    }
-                                }, 300);
-                                return;
-                            }
-                            
-                            if (playerState === -1 || playerState === 5) {
-                                console.log('Player not ready for seeking, waiting...');
-                                // Wait a bit and try again
-                                setTimeout(() => {
-                                    if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
-                                        const newState = playerRef.current.getPlayerState();
-                                        if (newState !== -1 && newState !== 5) {
-                                            console.log('Player ready now, attempting seek...');
-                                            playerRef.current.seekTo(currentTime, true);
-                                        }
-                                    }
-                                }, 500);
-                            } else if (typeof playerRef.current.seekTo === 'function') {
-                                console.log(`Executing seek to ${currentTime}...`);
-                                
-                                // Get current position before seeking
-                                const beforeSeek = playerRef.current.getCurrentTime();
-                                console.log(`Position before seek: ${beforeSeek}`);
-                                
-                                playerRef.current.seekTo(currentTime, true);
-                                console.log('Seek command executed');
-                                
-                                // Check if seek actually worked
-                                setTimeout(() => {
-                                    if (playerRef.current) {
-                                        const afterSeek = playerRef.current.getCurrentTime();
-                                        const seekResult = Math.abs(afterSeek - currentTime);
-                                        console.log(`Seek result: target=${currentTime}, actual=${afterSeek}, diff=${seekResult}`);
-                                        
-                                        if (seekResult > 1) {
-                                            console.warn('Seek failed, trying again...');
-                                            playerRef.current.seekTo(currentTime, true);
-                                        }
-                                    }
-                                }, 200);
-                            } else {
-                                console.warn('Player seekTo method not available');
-                            }
-                            
-                            // Verify the seek operation completed successfully
-                            setTimeout(() => {
-                                if (playerRef.current) {
-                                    const newTime = playerRef.current.getCurrentTime();
-                                    const seekDiff = Math.abs(newTime - currentTime);
-                                    console.log(`Seek verification: target=${currentTime}, actual=${newTime}, diff=${seekDiff}`);
-                                    
-                                    if (seekDiff > 1) {
-                                        console.warn('Seek operation may have failed, retrying...');
-                                        
-                                        // Try seeking to a slightly different position first, then to the target
-                                        const nearbyTime = currentTime + (Math.random() > 0.5 ? 1 : -1);
-                                        console.log(`Trying nearby seek first: ${nearbyTime}`);
-                                        playerRef.current.seekTo(nearbyTime, true);
-                                        
-                                        setTimeout(() => {
-                                            if (playerRef.current) {
-                                                console.log('Now seeking to target position...');
-                                                playerRef.current.seekTo(currentTime, true);
-                                            }
-                                        }, 100);
-                                        
-                                        // Add additional retry with exponential backoff
-                                        setTimeout(() => {
-                                            if (playerRef.current) {
-                                                const retryTime = playerRef.current.getCurrentTime();
-                                                const retryDiff = Math.abs(retryTime - currentTime);
-                                                console.log(`Retry seek verification: target=${currentTime}, actual=${retryTime}, diff=${retryDiff}`);
-                                                
-                                                if (retryDiff > 1) {
-                                                    console.warn('Second retry attempt...');
-                                                    playerRef.current.seekTo(currentTime, true);
-                                                    
-                                                    // Final retry attempt
-                                                    setTimeout(() => {
-                                                        if (playerRef.current) {
-                                                            const finalTime = playerRef.current.getCurrentTime();
-                                                            const finalDiff = Math.abs(finalTime - currentTime);
-                                                            console.log(`Final seek verification: target=${currentTime}, actual=${finalTime}, diff=${finalDiff}`);
-                                                            
-                                                            if (finalDiff > 1) {
-                                                                console.error('Seek operation failed after multiple attempts');
-                                                                
-                                                                // Final fallback: try pausing and resuming the video
-                                                                console.log('Trying pause/resume fallback...');
-                                                                playerRef.current.pauseVideo();
-                                                                setTimeout(() => {
-                                                                    if (playerRef.current) {
-                                                                        playerRef.current.seekTo(currentTime, true);
-                                                                        setTimeout(() => {
-                                                                            if (playerRef.current) {
-                                                                                playerRef.current.playVideo();
-                                                                            }
-                                                                        }, 100);
-                                                                    }
-                                                                }, 100);
-                                                            }
-                                                        }
-                                                    }, 200);
-                                                }
-                                            }
-                                        }, 200);
-                                    }
-                                    
-                                    // Update progress after seek verification
-                                    setProgress(newTime);
-                                }
-                            }, 100);
-                            
-                            // Don't update progress immediately, wait for verification
-                            // setProgress(currentTime);
-                        } else {
-                            console.log('Time difference too small, no sync needed');
+                        } catch (e) {
+                            console.warn('Error changing play state:', e);
                         }
-                        
-                        // Fallback sync - always try to sync even if main logic says no
-                        if (debugSync && message.type === 'playbackState') {
-                            console.log('Fallback sync: attempting to sync regardless of time difference');
-                            try {
-                                if (playerRef.current && typeof playerRef.current.seekTo === 'function') {
-                                    console.log(`Fallback seek to ${currentTime}`);
-                                    playerRef.current.seekTo(currentTime, true);
-                                    
-                                    // Verify fallback seek
-                                    setTimeout(() => {
-                                        if (playerRef.current) {
-                                            const fallbackTime = playerRef.current.getCurrentTime();
-                                            const fallbackDiff = Math.abs(fallbackTime - currentTime);
-                                            console.log(`Fallback seek result: target=${currentTime}, actual=${fallbackTime}, diff=${fallbackDiff}`);
-                                        }
-                                    }, 300);
-                                }
-                            } catch (error) {
-                                console.warn('Fallback sync failed:', error);
-                            }
-                        }
-                        
-                        // Sync play state
-                        const playerState = playerRef.current.getPlayerState();
-                        console.log(`Play state sync: owner wants ${isPlaying}, player state is ${playerState}`);
-                        
-                        if (isPlaying && playerState !== 1) {
-                            console.log('Following owner play command');
-                            playerRef.current.playVideo();
-                            setIsPlaying(true);
-                        } else if (!isPlaying && playerState === 1) {
-                            console.log('Following owner pause command');
-                            playerRef.current.pauseVideo();
-                            setIsPlaying(false);
-                        } else {
-                            console.log('Play state already in sync');
-                        }
-                    } catch (error) {
-                        console.warn('Error syncing video:', error);
-                    }
-                } else if (message.type === 'seekTo') {
-                    // Handle explicit seek messages from owner
-                    const { currentTime } = message;
-                    
-                    // Validate currentTime value
-                    if (typeof currentTime !== 'number' || isNaN(currentTime) || currentTime < 0) {
-                        console.warn('Invalid currentTime received in seekTo:', currentTime);
-                        return;
-                    }
-                    
-                    try {
-                        console.log(`Following owner seek to: ${currentTime}`);
-                        
-                        // Check if player is in a valid state for seeking
-                        const playerState = playerRef.current.getPlayerState();
-                        const videoDuration = playerRef.current.getDuration();
-                        
-                        // Ensure video is loaded and duration is available
-                        if (videoDuration <= 0) {
-                            console.log('Video not fully loaded yet, waiting...');
-                            setTimeout(() => {
-                                if (playerRef.current && playerRef.current.getDuration() > 0) {
-                                    console.log('Video loaded, attempting seek...');
-                                    playerRef.current.seekTo(currentTime, true);
-                                }
-                            }, 1000);
-                            return;
-                        }
-                        
-                        // Ensure video is playing before seeking (seeking works better when playing)
-                        const isCurrentlyPlaying = playerRef.current.getPlayerState() === 1;
-                        if (!isCurrentlyPlaying) {
-                            console.log('Starting video before seeking for better sync...');
-                            playerRef.current.playVideo();
-                            
-                            // Wait a bit for video to start, then seek
-                            setTimeout(() => {
-                                if (playerRef.current) {
-                                    console.log('Video started, now seeking...');
-                                    playerRef.current.seekTo(currentTime, true);
-                                }
-                            }, 300);
-                            return;
-                        }
-                        
-                        if (playerState === -1 || playerState === 5) {
-                            console.log('Player not ready for seeking, waiting...');
-                            // Wait a bit and try again
-                            setTimeout(() => {
-                                if (playerRef.current && typeof playerRef.current.getCurrentTime === 'function') {
-                                    const newState = playerRef.current.getPlayerState();
-                                    if (newState !== -1 && newState !== 5) {
-                                        console.log('Player ready now, attempting seek...');
-                                        playerRef.current.seekTo(currentTime, true);
-                                    }
-                                }
-                            }, 500);
-                        } else if (typeof playerRef.current.seekTo === 'function') {
-                            playerRef.current.seekTo(currentTime, true);
-                        } else {
-                            console.warn('Player seekTo method not available');
-                        }
-                        
-                        // Verify the seek operation completed successfully
-                        setTimeout(() => {
-                            if (playerRef.current) {
-                                const newTime = playerRef.current.getCurrentTime();
-                                const seekDiff = Math.abs(newTime - currentTime);
-                                console.log(`Seek verification: target=${currentTime}, actual=${newTime}, diff=${seekDiff}`);
-                                
-                                if (seekDiff > 1) {
-                                    console.warn('Seek operation may have failed, retrying...');
-                                    
-                                    // Try seeking to a slightly different position first, then to the target
-                                    const nearbyTime = currentTime + (Math.random() > 0.5 ? 1 : -1);
-                                    console.log(`Trying nearby seek first: ${nearbyTime}`);
-                                    playerRef.current.seekTo(nearbyTime, true);
-                                    
-                                    setTimeout(() => {
-                                        if (playerRef.current) {
-                                            console.log('Now seeking to target position...');
-                                            playerRef.current.seekTo(currentTime, true);
-                                        }
-                                    }, 100);
-                                    
-                                    // Add additional retry with exponential backoff
-                                    setTimeout(() => {
-                                        if (playerRef.current) {
-                                            const retryTime = playerRef.current.getCurrentTime();
-                                            const retryDiff = Math.abs(retryTime - currentTime);
-                                            console.log(`Retry seek verification: target=${currentTime}, actual=${retryTime}, diff=${retryDiff}`);
-                                            
-                                            if (retryDiff > 1) {
-                                                console.warn('Second retry attempt...');
-                                                playerRef.current.seekTo(currentTime, true);
-                                                
-                                                // Final retry attempt
-                                                setTimeout(() => {
-                                                    if (playerRef.current) {
-                                                        const finalTime = playerRef.current.getCurrentTime();
-                                                        const finalDiff = Math.abs(finalTime - currentTime);
-                                                        console.log(`Final seek verification: target=${currentTime}, actual=${finalTime}, diff=${finalDiff}`);
-                                                        
-                                                        if (finalDiff > 1) {
-                                                            console.error('Seek operation failed after multiple attempts');
-                                                            
-                                                            // Final fallback: try pausing and resuming the video
-                                                            console.log('Trying pause/resume fallback...');
-                                                            playerRef.current.pauseVideo();
-                                                            setTimeout(() => {
-                                                                if (playerRef.current) {
-                                                                    playerRef.current.seekTo(currentTime, true);
-                                                                    setTimeout(() => {
-                                                                        if (playerRef.current) {
-                                                                            playerRef.current.playVideo();
-                                                                        }
-                                                                    }, 100);
-                                                                }
-                                                            }, 100);
-                                                        }
-                                                    }
-                                                }, 200);
-                                            }
-                                        }
-                                    }, 200);
-                                }
-                                
-                                // Update progress after seek verification
-                                setProgress(newTime);
-                            }
-                        }, 100);
-                        
-                        // Don't update progress immediately, wait for verification
-                        // setProgress(currentTime);
-                    } catch (error) {
-                        console.warn('Error seeking video:', error);
-                    }
-                }
-            }
-        }
-    }, [lastMessageId, isOwner, playerReady, sendJsonMessage, setIsPlaying]);
-
-
-    // Progress bar and owner sync
-    useEffect(() => {
-        const interval = setInterval(() => {
-            if (playerRef.current && playerReady) {
-                try {
-                    const currentTime = playerRef.current.getCurrentTime();
-                    setProgress(currentTime);
-                    
-                    // Only send sync if owner and more frequently for better sync
-                    if (isOwner) {
-                        // Create message and send sync every 1.5 seconds for better reliability
-                        const message = { type: 'playbackState', isPlaying, currentTime };
-                        const messageStr = JSON.stringify(message);
-                        
-                        // Send sync message every 1.5 seconds for better synchronization
-                        const timeSinceLastSync = Date.now() - (lastSyncRef.current.lastSyncTime || 0);
-                        if (timeSinceLastSync > 1500) {
-                            sendJsonMessage(message);
-                            lastMessageRef.current = messageStr;
-                            lastSyncRef.current.lastSyncTime = Date.now();
-                            console.log('Owner sent sync message:', message);
-                        }
-                    }
-                } catch (error) {
-                    console.warn('Player not ready yet:', error);
-                }
-            }
-        }, 1500); // Send sync every 1.5 seconds for better synchronization
-        
-        return () => clearInterval(interval);
-    }, [playerReady, isOwner, isPlaying, sendJsonMessage, progress]);
-
-    const handlePlayPause = () => {
-        if (!playerRef.current || !playerReady) return;
-        try {
-            if (isPlaying) {
-                playerRef.current.pauseVideo();
-                if (isOwner) {
-                    const currentTime = playerRef.current.getCurrentTime();
-                    const message = { type: 'playbackState', isPlaying: false, currentTime };
-                    sendJsonMessage(message);
-                    lastMessageRef.current = JSON.stringify(message);
-                    lastSyncRef.current.lastSyncTime = Date.now(); // Update sync time
-                    sendNotificationToRoom(roomId, "The owner paused the track.");
+                    }, timeDiff > SYNC_THRESHOLD ? 500 : 100); // Wait longer if we also seeked
                 }
             } else {
-                playerRef.current.playVideo();
-                if (isOwner) {
-                    const currentTime = playerRef.current.getCurrentTime();
-                    const message = { type: 'playbackState', isPlaying: true, currentTime };
-                    sendJsonMessage(message);
-                    lastMessageRef.current = JSON.stringify(message);
-                    lastSyncRef.current.lastSyncTime = Date.now(); // Update sync time
-                    sendNotificationToRoom(roomId, "The owner started the track.");
+                console.log('Member already in sync');
+            }
+        } catch (error) {
+            console.error('Error during sync:', error);
+        } finally {
+            setTimeout(() => {
+                isSyncingRef.current = false;
+                setSyncStatus('connected');
+            }, 1000);
+        }
+    }, [isPlayerReady, isValidTime, memberPaused]);
+
+    // Handle WebSocket messages
+    useEffect(() => {
+        if (!lastJsonMessage) return;
+
+        const message = lastJsonMessage as any;
+        console.log('Received message:', message);
+
+        // Only process messages from the admin
+        if (message.adminId && !isOwner) {
+            if (message.type === 'playbackState') {
+                const { isPlaying: targetPlaying, currentTime: targetTime } = message;
+                if (isValidTime(targetTime)) {
+                    syncWithAdmin(targetTime, targetPlaying);
+                }
+            } else if (message.type === 'seekTo') {
+                const { currentTime: targetTime } = message;
+                if (isValidTime(targetTime)) {
+                    syncWithAdmin(targetTime, isPlaying);
                 }
             }
-        } catch (error) {
-            console.warn('Player not ready yet:', error);
         }
-    };
 
-    const handleSeek = (value: number[]) => {
-        if (!playerRef.current || !playerReady) return;
-        try {
-            const newTime = value[0];
-            playerRef.current.seekTo(newTime, true);
-            setProgress(newTime);
-            if (isOwner) {
-                // Send explicit seek message for immediate sync
-                const seekMessage = { type: 'seekTo', currentTime: newTime };
-                sendJsonMessage(seekMessage);
-                
-                // Also send playback state for consistency
-                const stateMessage = { type: 'playbackState', currentTime: newTime, isPlaying };
-                sendJsonMessage(stateMessage);
-                
-                // Update last message and sync time to prevent duplicate sync
-                lastMessageRef.current = JSON.stringify(stateMessage);
-                lastSyncRef.current.lastSyncTime = Date.now();
+        // Handle state requests (admin responds)
+        if (message.type === 'requestState' && isOwner && isPlayerReady()) {
+            try {
+                const currentTime = playerRef.current!.getCurrentTime();
+                const response = { 
+                    type: 'playbackState', 
+                    isPlaying, 
+                    currentTime,
+                    adminId: user?.uid 
+                };
+                sendJsonMessage(response);
+                console.log('Admin responding to state request:', response);
+            } catch (error) {
+                console.warn('Error responding to state request:', error);
             }
-        } catch (error) {
-            console.warn('Player not ready yet:', error);
         }
-    };
+    }, [lastJsonMessage, isOwner, isPlaying, user?.uid, sendJsonMessage, syncWithAdmin, isValidTime]);
 
-    const handleFullscreen = () => {
-        if (!playerRef.current || !playerReady) return;
+    // Admin periodic sync broadcasting
+    useEffect(() => {
+        if (!isOwner || !isPlayerReady()) return;
+
+        let lastBroadcastTime = 0;
+
+        const interval = setInterval(() => {
+            try {
+                const currentTime = playerRef.current!.getCurrentTime();
+                const currentState = playerRef.current!.getPlayerState();
+                const currentlyPlaying = currentState === 1;
+                
+                // Detect if admin seeked (big time jump)
+                const timeDiff = Math.abs(currentTime - lastBroadcastTime);
+                const isSeek = timeDiff > SYNC_THRESHOLD && lastBroadcastTime > 0;
+                
+                // Always send sync to keep members in sync
+                if (isValidTime(currentTime)) {
+                    const message = { 
+                        type: 'playbackState', 
+                        isPlaying: currentlyPlaying, 
+                        currentTime,
+                        adminId: user?.uid,
+                        timestamp: Date.now(),
+                        source: isSeek ? 'periodicSeek' : 'periodic'
+                    };
+                    sendJsonMessage(message);
+                    console.log(`Admin ${isSeek ? 'SEEK' : 'sync'} broadcast:`, { currentlyPlaying, currentTime: currentTime.toFixed(1) });
+                    lastSyncTimeRef.current = Date.now();
+                }
+                
+                lastBroadcastTime = currentTime;
+            } catch (error) {
+                console.warn('Error in admin sync interval:', error);
+            }
+        }, SYNC_INTERVAL);
+
+        return () => clearInterval(interval);
+    }, [isOwner, user?.uid, sendJsonMessage, isValidTime]); // Add proper dependencies
+
+    // Non-admin periodic state requests
+    useEffect(() => {
+        if (isOwner || !isPlayerReady()) return;
+
+        // Request initial state
+        sendJsonMessage({ type: 'requestState' });
+
+        const interval = setInterval(() => {
+            sendJsonMessage({ type: 'requestState' });
+        }, STATE_REQUEST_INTERVAL);
+
+        return () => clearInterval(interval);
+    }, [isOwner, sendJsonMessage]);
+
+    // Progress tracking
+    useEffect(() => {
+        if (!playerReady || !playerRef.current) {
+            return;
+        }
+
+        const interval = setInterval(() => {
+            try {
+                if (!playerRef.current) {
+                    return;
+                }
+
+                const currentTime = playerRef.current.getCurrentTime();
+                const videoDuration = playerRef.current.getDuration();
+                const playerState = playerRef.current.getPlayerState();
+                const isCurrentlyPlaying = playerState === 1; // 1 = playing
+                
+                // Always update progress for smooth UI if valid
+                if (isValidTime(currentTime) && currentTime >= 0) {
+                    setProgress(currentTime);
+                }
+                
+                // Update duration if it has changed and is valid
+                if (videoDuration && videoDuration > 0 && isValidTime(videoDuration) && Math.abs(videoDuration - duration) > 0.1) {
+                    console.log('Setting video duration:', videoDuration);
+                    setDuration(videoDuration);
+                }
+                
+                // Update playing state if changed
+                if (isCurrentlyPlaying !== isPlaying) {
+                    setIsPlaying(isCurrentlyPlaying);
+                }
+                
+            } catch (error) {
+                console.warn('Error updating progress:', error);
+            }
+        }, 500); // Update every 500ms for smoother progress
+
+        return () => {
+            clearInterval(interval);
+        };
+    }, [playerReady, isValidTime]); // Remove duration dependency to prevent loops
+
+    // Format time for display
+    const formatTime = useCallback((seconds: number) => {
+        if (!isValidTime(seconds)) return '0:00';
+        const mins = Math.floor(seconds / 60);
+        const secs = Math.floor(seconds % 60);
+        return `${mins}:${secs.toString().padStart(2, '0')}`;
+    }, [isValidTime]);
+
+    // Fullscreen handler
+    const handleFullscreen = useCallback(() => {
+        const videoContainer = document.getElementById('youtube-player');
+        if (!videoContainer) return;
+
         try {
             if (isFullscreen) {
                 // Exit fullscreen
                 if (document.exitFullscreen) {
                     document.exitFullscreen();
-                }  else if (document.exitFullscreen) {
-                    document.exitFullscreen();
                 }
             } else {
                 // Enter fullscreen
-                const iframe = (playerRef.current as any).getIframe();
-                if (iframe?.requestFullscreen) {
-                    iframe.requestFullscreen();
-                } else if (iframe?.webkitRequestFullscreen) {
-                    // Safari support
-                    iframe.webkitRequestFullscreen();
-                } else if (iframe?.mozRequestFullScreen) {
-                    // Firefox support
-                    iframe.mozRequestFullScreen();
-                } else if (iframe?.msRequestFullscreen) {
-                    // IE/Edge support
-                    iframe.msRequestFullscreen();
+                if (videoContainer.requestFullscreen) {
+                    videoContainer.requestFullscreen();
+                } else if ((videoContainer as any).webkitRequestFullscreen) {
+                    (videoContainer as any).webkitRequestFullscreen();
+                } else if ((videoContainer as any).mozRequestFullScreen) {
+                    (videoContainer as any).mozRequestFullScreen();
+                } else if ((videoContainer as any).msRequestFullscreen) {
+                    (videoContainer as any).msRequestFullscreen();
                 }
             }
         } catch (error) {
             console.warn('Fullscreen not supported:', error);
         }
-    };
+    }, [isFullscreen]);
+
+    // Start Jam handler - starts playing the first track in queue
+    const handleStartJam = useCallback(async () => {
+        if (!isOwner) return;
+
+        const queuedTracks = queue.filter(t => t.status === 'queued');
+        
+        if (queuedTracks.length === 0) {
+            toast({
+                title: "Add Videos to Queue",
+                description: "Add some videos to the queue before starting the jam!",
+                variant: "destructive"
+            });
+            return;
+        }
+
+        try {
+            await playNextTrackInQueue(roomId);
+            await sendNotificationToRoom(roomId, "🎵 The jam has started! Let's vibe together!");
+            toast({
+                title: "Jam Started!",
+                description: "The music is now playing. Enjoy the vibes!",
+            });
+        } catch (error) {
+            console.error('Error starting jam:', error);
+            toast({
+                title: "Error",
+                description: "Failed to start the jam. Please try again.",
+                variant: "destructive"
+            });
+        }
+    }, [isOwner, queue, roomId, toast]);
 
     return (
         <Card className="w-full overflow-hidden glassmorphism">
             <CardContent className="p-0 h-full w-full">
-                <div className="aspect-video w-full relative">
+                <div className="aspect-video w-full relative bg-black/10">
                     {track ? (
-                        <div id="youtube-player" className="w-full h-full"></div>
+                        <div className="relative w-full h-full bg-black">
+                            {/* YouTube player container */}
+                            <div 
+                                id="youtube-player" 
+                                className="w-full h-full absolute inset-0"
+                                style={{ backgroundColor: '#000' }}
+                            ></div>
+                            
+                            {/* Fullscreen button overlay */}
+                            <button 
+                                onClick={handleFullscreen}
+                                className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/70 rounded-lg transition-colors z-10"
+                                title={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+                            >
+                                {isFullscreen ? <Minimize size={20} className="text-white" /> : <Maximize size={20} className="text-white" />}
+                            </button>
+                        </div>
                     ) : (
                         <div className="w-full h-full bg-secondary flex flex-col items-center justify-center text-muted-foreground">
-                            <Music className="h-24 w-24 text-primary/20" />
-                            <h2 className="font-headline text-2xl font-semibold mt-4">Lo-Fi Lounge</h2>
-                            <p>No track is currently playing.</p>
+                            <Music className="h-24 w-24 text-primary/20 mb-4" />
+                            <h2 className="font-headline text-2xl font-semibold mb-2">Lo-Fi Lounge</h2>
+                            <p className="mb-6 text-center">No track is currently playing.</p>
+                            
+                            {/* Show Start Jam button for room owner */}
+                            {isOwner && (
+                                <Button 
+                                    onClick={handleStartJam}
+                                    size="lg"
+                                    className="bg-primary hover:bg-primary/90 text-primary-foreground font-semibold px-8 py-3 rounded-full shadow-lg transition-all transform hover:scale-105"
+                                >
+                                    <PlayCircle className="h-5 w-5 mr-2" />
+                                    Start Jam!
+                                </Button>
+                            )}
+                            
+                            {/* Show message for non-owners */}
+                            {!isOwner && (
+                                <p className="text-sm text-muted-foreground bg-muted/50 px-4 py-2 rounded-full">
+                                    Waiting for the room admin to start the jam...
+                                </p>
+                            )}
                         </div>
                     )}
-                    
-                    {/* Fullscreen button positioned at bottom right of video */}
-                    {/* Removed fullscreen functionality to prevent syncing issues */}
                 </div>
+                
                 {track && (
-                    <div className="p-4 flex items-center gap-4">
-                        {isOwner && (
-                            <>
-                                <button onClick={handlePlayPause} className="p-2">
-                                    {isPlaying ? <Pause size={24} /> : <Play size={24} />}
-                                </button>
-                                <Slider
-                                    value={[progress]}
-                                    max={duration}
-                                    step={1}
-                                    onValueChange={handleSeek}
-                                />
-                            </>
-                        )}
-                        <div className="text-sm text-muted-foreground min-w-[80px] text-center">
-                            {Math.floor(progress)}:{(progress % 60).toString().padStart(2, '0')} / {Math.floor(duration)}:{(duration % 60).toString().padStart(2, '0')}
+                    <div className="p-4 space-y-3">
+                        {/* Time display for everyone */}
+                        <div className="flex items-center justify-between text-sm text-muted-foreground">
+                            <div className="flex items-center gap-3">
+                                {/* Sync status for non-owners - moved to left */}
+                                {!isOwner && (
+                                    <div className="flex items-center gap-2">
+                                        <div className={`w-2 h-2 rounded-full ${
+                                            memberPaused ? 'bg-blue-500' :
+                                            syncStatus === 'connected' ? 'bg-green-500' :
+                                            syncStatus === 'syncing' ? 'bg-yellow-500 animate-pulse' :
+                                            'bg-red-500'
+                                        }`} />
+                                        <span className="text-xs">
+                                            {memberPaused ? 'Paused' :
+                                             syncStatus === 'connected' ? 'Synced' :
+                                             syncStatus === 'syncing' ? 'Syncing...' :
+                                             'Disconnected'}
+                                        </span>
+                                    </div>
+                                )}
+                                {/* Admin indicator */}
+                                {isOwner && (
+                                    <div className="text-xs text-primary bg-primary/10 px-2 py-1 rounded-full">
+                                        Admin
+                                    </div>
+                                )}
+                            </div>
+                            <div className="text-sm text-muted-foreground">
+                                {formatTime(progress)} / {formatTime(duration || 0)}
+                            </div>
                         </div>
+                        
+                        {/* Note for members */}
+                        {!isOwner && (
+                            <div className="text-center">
+                                <p className="text-xs text-muted-foreground bg-muted/30 px-3 py-1 rounded-full inline-block">
+                                    Synced with room admin
+                                </p>
+                            </div>
+                        )}
                     </div>
                 )}
             </CardContent>
         </Card>
     );
-}
+});
+
+export default VideoPlayer;

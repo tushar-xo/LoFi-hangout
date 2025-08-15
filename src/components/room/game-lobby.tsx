@@ -74,11 +74,17 @@ export default function GameLobby({ roomId, activeGame, onGameStart }: GameLobby
     }, [lastJsonMessage, toast]);
 
     const handleJoinQueue = (gameId: string) => {
+        console.log('handleJoinQueue called with gameId:', gameId);
+        console.log('Current inviteStatus:', inviteStatus);
+        console.log('sendJsonMessage function available:', !!sendJsonMessage);
+        
         if (inviteStatus?.status === 'sent') {
             // Already sent invitations
+            console.log('Already sent invitations, returning early');
             return;
         }
         
+        console.log('Sending joinQueue message:', { type: 'joinQueue', gameId });
         sendJsonMessage({ type: 'joinQueue', gameId });
         setInviteStatus({ status: 'sent', gameId });
         toast({
@@ -132,7 +138,10 @@ export default function GameLobby({ roomId, activeGame, onGameStart }: GameLobby
                                         </div>
                                     ) : (
                                         <Button 
-                                            onClick={() => handleJoinQueue(game.id)} 
+                                            onClick={() => {
+                                                console.log('Game button clicked for:', game.id);
+                                                handleJoinQueue(game.id);
+                                            }} 
                                             className="w-full h-12 text-base font-semibold bg-gradient-to-r from-primary to-primary/80 hover:from-primary/90 hover:to-primary/70 transition-all duration-200 shadow-lg hover:shadow-xl"
                                             disabled={inviteStatus?.status === 'sent'}>
                                             🎮 Send Game Invitations

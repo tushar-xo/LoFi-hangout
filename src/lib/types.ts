@@ -29,6 +29,7 @@ export interface Room {
   name: string;
   slug: string;
   isPrivate: boolean;
+  password?: string; // Optional password for private rooms
   imageUrl: string;
   members: User[];
   queue: Track[];
@@ -50,3 +51,28 @@ export interface ChatMessage {
     text: string;
     timestamp: Date;
 }
+
+export interface PlaybackStateMessage {
+  type: 'playbackState';
+  isPlaying: boolean;
+  currentTime: number;
+  adminId?: string; // ID of the admin sending the message
+}
+
+export interface SeekToMessage {
+  type: 'seekTo';
+  currentTime: number;
+  adminId?: string; // ID of the admin sending the message
+}
+
+export interface RequestStateMessage {
+  type: 'requestState';
+}
+
+export interface TrackEndedMessage {
+  type: 'trackEnded';
+  message: string;
+  adminId?: string;
+}
+
+export type WebSocketMessage = PlaybackStateMessage | SeekToMessage | RequestStateMessage | TrackEndedMessage | { type: string; [key: string]: any };

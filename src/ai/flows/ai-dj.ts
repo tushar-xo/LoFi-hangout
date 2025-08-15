@@ -32,10 +32,9 @@ const AiDjOutputSchema = z.object({
   vote: z.enum(['upvote', 'downvote', 'none']).describe('The AI DJ suggestion to upvote, downvote, or do nothing.'),
   reasoning: z.string().describe('The AI DJ reasoning for the vote suggestion.'),
   songSuggestions: z.array(z.object({
-    title: z.string(),
-    artist: z.string(),
-    thumbnail: z.string(),
-    link: z.string(),
+    title: z.string().describe('The exact song title'),
+    artist: z.string().describe('The artist/band name'),
+    link: z.string().describe('The YouTube URL for the song'),
   })).optional().describe('Up to three song suggestions based on the current track.'),
 });
 export type AiDjOutput = z.infer<typeof AiDjOutputSchema>;
@@ -55,15 +54,37 @@ const prompt = ai.definePrompt({
   name: 'aiDjPrompt',
   input: {schema: AiDjInputSchema},
   output: {schema: AiDjOutputSchema},
-  prompt: `You are an AI DJ and music expert. {{#if currentTrack}}I'm watching a video titled "{{currentTrack.title}}" on YouTube.{{else}}No track is currently playing.{{/if}} Suggest three similar videos/songs.
+  prompt: `You are an AI DJ and music expert. {{#if currentTrack}}I'm watching a video titled "{{currentTrack.title}}" on YouTube.{{else}}No track is currently playing.{{/if}}
 
-For each suggestion, provide:
-- The title of the video/song
-- The artist
-- A thumbnail image URL
-- A YouTube link
+Based on the current track and room history, please:
 
-Return your suggestions as a JSON array.`,
+1. **Vote Decision**: Decide whether to upvote, downvote, or do nothing (none) for the current track. Consider the musical style, quality, and how it fits with the room's vibe.
+
+2. **Reasoning**: Provide a brief explanation for your vote decision.
+
+3. **Song Suggestions**: Suggest exactly 3 similar songs that would fit well in this room. For each suggestion, provide:
+   - **title**: The exact song title
+   - **artist**: The artist/band name  
+   - **link**: A valid YouTube URL/link for the song youre recommending! double check it works!
+
+IMPORTANT: 
+- Return your response in the exact JSON format specified
+- Do NOT include thumbnail URLs or broken image links
+- Ensure all YouTube URLs are valid and accessible
+- Focus on songs that are similar in style, mood, or genre to the current track
+
+Example output format:
+{
+  "vote": "upvote",
+  "reasoning": "This track has a great vibe that fits the room's energy",
+  "songSuggestions": [
+    {
+      "title": "Song Title Here",
+      "artist": "Artist Name",
+      "link": "https://www.youtube.com/watch?v=VIDEO_ID"
+    }
+  ]
+}`,
 });
 
 const aiDjFlow = ai.defineFlow(
