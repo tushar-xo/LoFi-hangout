@@ -139,11 +139,7 @@ export async function playNextTrackInQueue(roomId: string): Promise<void> {
     const sortedQueue = queue
         .filter((t: Track) => t.status === 'queued')
         .sort((a: Track, b: Track) => {
-            // First sort by admin order if set
-            if (a.queueOrder !== undefined && b.queueOrder !== undefined) {
-                return a.queueOrder - b.queueOrder;
-            }
-            // Then by score
+            // Sort by score
             const scoreA = a.upvotes.length - a.downvotes.length;
             const scoreB = b.upvotes.length - b.downvotes.length;
             return scoreB - scoreA;

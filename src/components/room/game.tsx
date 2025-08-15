@@ -5,7 +5,7 @@ import { useSocket } from '@/hooks/use-socket';
 import { Button } from '@/components/ui/button';
 
 export default function Game() {
-    const { sendJsonMessage, lastJsonMessage } = useSocket('game-user');
+    const { sendJsonMessage, lastJsonMessage } = useSocket('game-user', 'game-room');
     const [clickCount, setClickCount] = useState(0);
 
     useEffect(() => {

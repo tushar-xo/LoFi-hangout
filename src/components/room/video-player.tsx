@@ -88,19 +88,19 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
     useEffect(() => {
         if (!track) {
             if (playerRef.current && playerReady) {
-                playerRef.current.stopVideo();
+                (playerRef.current as any).stopVideo();
             }
             return;
         }
 
         if (isApiReady) {
             if (playerRef.current) {
-                playerRef.current.loadVideoById(track.videoId);
+                (playerRef.current as any).loadVideoById(track.videoId);
                 // Send sync when track changes
                 if (isOwner) {
                     setTimeout(() => {
                         if (playerRef.current && playerReady) {
-                            const currentTime = playerRef.current.getCurrentTime();
+                            const currentTime = (playerRef.current as any).getCurrentTime();
                             const message = { type: 'playbackState', isPlaying: true, currentTime };
                             sendJsonMessage(message);
                             lastMessageRef.current = JSON.stringify(message);
@@ -109,7 +109,7 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
                     }, 1000); // Wait 1 second for player to load
                 }
             } else {
-                playerRef.current = new window.YT.Player('youtube-player', {
+                playerRef.current = new (window as any).YT.Player('youtube-player', {
                     videoId: track.videoId,
                     playerVars: {
                         autoplay: 1,
@@ -119,35 +119,34 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
                         showinfo: 0, // Hide video info
                         fs: 0, // Disable fullscreen button
                         playsinline: 1,
-                        cc_load_policy: 0, // Hide captions
                         iv_load_policy: 3, // Show video annotations
                         color: 'white', // Player color
                         enablejsapi: 1, // Enable JavaScript API
                         origin: window.location.origin, // Set origin for security
                     },
                     events: {
-                        onReady: (event) => {
+                        onReady: (event: any) => {
                             setPlayerReady(true);
-                            event.target.playVideo();
-                            setDuration(event.target.getDuration());
+                            (event.target as any).playVideo();
+                            setDuration((event.target as any).getDuration());
                             
                             // Send initial sync when player is ready
                             if (isOwner) {
-                                const currentTime = event.target.getCurrentTime();
+                                const currentTime = (event.target as any).getCurrentTime();
                                 const message = { type: 'playbackState', isPlaying: true, currentTime };
                                 sendJsonMessage(message);
                                 lastMessageRef.current = JSON.stringify(message);
                                 console.log('Initial sync sent:', message);
                             }
                         },
-                        onStateChange: (event) => {
+                        onStateChange: (event: any) => {
                             const wasPlaying = isPlaying;
-                            const newPlaying = event.data === window.YT.PlayerState.PLAYING;
+                            const newPlaying = event.data === (window as any).YT.PlayerState.PLAYING;
                             setIsPlaying(newPlaying);
                             
                             // Send immediate sync when play state changes
                             if (isOwner && wasPlaying !== newPlaying) {
-                                const currentTime = event.target.getCurrentTime();
+                                const currentTime = (event.target as any).getCurrentTime();
                                 const message = { type: 'playbackState', isPlaying: newPlaying, currentTime };
                                 sendJsonMessage(message);
                                 lastMessageRef.current = JSON.stringify(message);
@@ -155,7 +154,7 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
                             }
                             
                             // Auto-play next video when current one ends
-                            if (event.data === window.YT.PlayerState.ENDED) {
+                            if (event.data === (window as any).YT.PlayerState.ENDED) {
                                 console.log('Video ended, auto-playing next track');
                                 // Send notification that next track is starting
                                 if (isOwner) {
@@ -190,7 +189,7 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
             
             // Force sync with last received message every 2 seconds
             const forceSyncInterval = setInterval(() => {
-                if (playerRef.current && playerReady && lastJsonMessage && lastJsonMessage.type === 'playbackState') {
+                if (playerRef.current && playerReady && lastJsonMessage && (lastJsonMessage as any).type === 'playbackState') {
                     console.log('Force sync interval triggered, processing last message');
                     processWebSocketMessage(lastJsonMessage);
                 }
@@ -506,13 +505,13 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
             // Final fallback - try to force sync by reloading the video
             try {
                 console.log('Attempting fallback sync by reloading video...');
-                const currentVideoId = player.getVideoData().video_id;
+                const currentVideoId = (player as any).getVideoData().video_id;
                 if (currentVideoId) {
-                    player.loadVideoById(currentVideoId);
+                    (player as any).loadVideoById(currentVideoId);
                     setTimeout(() => {
                         if (player) {
-                            player.seekTo(currentTime, true);
-                            player.playVideo();
+                            (player as any).seekTo(currentTime, true);
+                            (player as any).playVideo();
                         }
                     }, 2000);
                 }
@@ -1144,16 +1143,12 @@ export default function VideoPlayer({ track, roomId, isOwner }: VideoPlayerProps
                 // Exit fullscreen
                 if (document.exitFullscreen) {
                     document.exitFullscreen();
-                } else if (document.webkitExitFullscreen) {
-                    document.webkitExitFullscreen();
-                } else if (document.mozCancelFullScreen) {
-                    document.mozCancelFullScreen();
-                } else if (document.msExitFullscreen) {
-                    document.msExitFullscreen();
+                }  else if (document.exitFullscreen) {
+                    document.exitFullscreen();
                 }
             } else {
                 // Enter fullscreen
-                const iframe = playerRef.current.getIframe();
+                const iframe = (playerRef.current as any).getIframe();
                 if (iframe?.requestFullscreen) {
                     iframe.requestFullscreen();
                 } else if (iframe?.webkitRequestFullscreen) {

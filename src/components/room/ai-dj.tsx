@@ -44,7 +44,7 @@ export default function AiDjPanel({ roomHistory, currentTrack, roomId }: AiDjPan
       };
 
       setLog(prevLog => [newLogEntry, ...prevLog]);
-      setLastAnalyzedTrackId(currentTrack.id);
+      setLastAnalyzedTrackId(currentTrack.videoId);
       toast({
         title: "AI DJ Voted!",
         description: `The AI DJ decided to ${result.vote} "${currentTrack.title}".`,
@@ -63,7 +63,7 @@ export default function AiDjPanel({ roomHistory, currentTrack, roomId }: AiDjPan
   };
 
   useEffect(() => {
-    if (isAiEnabled && currentTrack && currentTrack.id !== lastAnalyzedTrackId) {
+    if (isAiEnabled && currentTrack && currentTrack.videoId !== lastAnalyzedTrackId) {
       // Run once immediately
       runAiDj();
 
@@ -81,7 +81,7 @@ export default function AiDjPanel({ roomHistory, currentTrack, roomId }: AiDjPan
         clearInterval(intervalRef.current);
       }
     };
-  }, [isAiEnabled, currentTrack?.id, lastAnalyzedTrackId]);
+  }, [isAiEnabled, currentTrack?.videoId, lastAnalyzedTrackId]);
 
   const handleAddSuggestion = async (song: string) => {
     try {

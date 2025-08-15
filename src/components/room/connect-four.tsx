@@ -81,7 +81,7 @@ export default function ConnectFour() {
 
             <div className="bg-blue-600/20 p-4 rounded-2xl border-2 border-blue-500/30 max-w-fit mx-auto">
                 <div className="grid grid-cols-7 gap-1">
-                    {board.map((row, r) => row.map((_, c) => renderSquare(r, c)))}
+                    {board.map((row, r) => row.map((cell: any, c: number) => renderSquare(r, c)))}
                 </div>
             </div>
 

@@ -20,12 +20,31 @@ const tracks: Omit<Track, 'id'>[] = [
 const rooms: Room[] = [
     {
         id: 'room-1',
-        name: 'Chill Beats to Relax/Study To',
-        slug: 'chill-beats-to-relax-study-to',
+        name: 'Lo-Fi Chill Vibes',
+        slug: 'lofi-chill-vibes',
         isPrivate: false,
-        members: users,
-        queue: tracks.map((t, i) => ({ ...t, id: `track-${i+1}` })),
-        imageUrl: 'https://placehold.co/400x200/A892EE/28282B.png'
+        members: [
+            { id: 'user-1', name: 'Alex', avatarUrl: 'https://placehold.co/100x100/6366F1/FFFFFF.png' },
+            { id: 'user-2', name: 'Sam', avatarUrl: 'https://placehold.co/100x100/8B5CF6/FFFFFF.png' },
+            { id: 'user-3', name: 'Jordan', avatarUrl: 'https://placehold.co/100x100/EC4899/FFFFFF.png' }
+        ],
+        queue: [
+            {
+                id: 'track-1',
+                videoId: 'jfKfPfyJRdk',
+                title: 'lofi hip hop radio 📚 - beats to relax/study to',
+                artist: 'Lofi Girl',
+                durationSec: 0,
+                thumbnailUrl: 'https://placehold.co/120x90/6366F1/FFFFFF.png',
+                upvotes: ['user-1', 'user-2'],
+                downvotes: [],
+                status: 'playing' as const,
+                addedBy: 'user-1'
+            }
+        ],
+        imageUrl: 'https://placehold.co/400x200/A892EE/28282B.png',
+        ownerId: 'user-1',
+        totalMembers: 3
     },
 ];
 
