@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 20% 97%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 255 70% 65%;
+    --primary-foreground: 255 75% 10%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 175 40% 50%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 255 70% 65%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 240 4% 16%;
+    --foreground: 0 0% 98%;
+    --card: 240 4% 18%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 4% 16%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 255 75% 75%;
+    --primary-foreground: 255 75% 15%;
+    --secondary: 240 4% 25%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 4% 30%;
+    --muted-foreground: 240 4% 65%;
+    --accent: 175 36% 61%;
+    --accent-foreground: 175 36% 10%;
+    --destructive: 0 62.8% 50.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 4% 25%;
+    --input: 240 4% 25%;
+    --ring: 255 75% 75%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+.glassmorphism {
+    @apply bg-card/60 backdrop-blur-lg border border-white/10;
+}
+
+.dark .glassmorphism {
+    @apply bg-card/30 backdrop-blur-xl border border-white/10;
+}
