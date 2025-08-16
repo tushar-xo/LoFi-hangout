@@ -39,6 +39,8 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
     const [syncStatus, setSyncStatus] = useState<'connected' | 'syncing' | 'disconnected'>('disconnected');
     const [isFullscreen, setIsFullscreen] = useState(false);
     const [memberPaused, setMemberPaused] = useState(false); // Track if member manually paused
+    const [apiLoading, setApiLoading] = useState(true);
+    const [playerLoading, setPlayerLoading] = useState(false);
     
     const { user } = useAuth();
     const { sendJsonMessage, lastJsonMessage, readyState } = useSocket(user?.uid || 'Anonymous', roomId);
@@ -95,50 +97,68 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
             if (window.YT && window.YT.Player) {
                 console.log('YouTube API already loaded');
                 isApiReady.current = true;
-                return;
+                setApiLoading(false);
+                return Promise.resolve();
             }
 
             if (document.querySelector('script[src*="youtube.com/iframe_api"]')) {
                 // Script is already loading, wait for it
-                const checkAPI = () => {
-                    if (window.YT && window.YT.Player) {
-                        console.log('YouTube API loaded');
-                        isApiReady.current = true;
-                    } else {
-                        setTimeout(checkAPI, 100);
-                    }
-                };
-                checkAPI();
-                return;
+                return new Promise<void>((resolve) => {
+                    const checkAPI = () => {
+                        if (window.YT && window.YT.Player) {
+                            console.log('YouTube API loaded');
+                            isApiReady.current = true;
+                            setApiLoading(false);
+                            resolve();
+                        } else {
+                            setTimeout(checkAPI, 100);
+                        }
+                    };
+                    checkAPI();
+                });
             }
 
             // Load the YouTube API script
-            const tag = document.createElement('script');
-            tag.src = 'https://www.youtube.com/iframe_api';
-            tag.async = true;
-            
-            const firstScriptTag = document.getElementsByTagName('script')[0];
-            firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
-            
-            // Set up global callback
-            (window as any).onYouTubeIframeAPIReady = () => {
-                console.log('YouTube API ready via callback');
-                isApiReady.current = true;
-            };
-            
-            // Fallback polling in case callback doesn't fire
-            const checkAPI = () => {
-                if (window.YT && window.YT.Player) {
-                    console.log('YouTube API ready via polling');
+            return new Promise<void>((resolve, reject) => {
+                const tag = document.createElement('script');
+                tag.src = 'https://www.youtube.com/iframe_api';
+                tag.async = true;
+                
+                // Set up global callback BEFORE adding script
+                (window as any).onYouTubeIframeAPIReady = () => {
+                    console.log('YouTube API ready via callback');
                     isApiReady.current = true;
-                } else {
-                    setTimeout(checkAPI, 100);
-                }
-            };
-            setTimeout(checkAPI, 1000);
+                    setApiLoading(false);
+                    resolve();
+                };
+                
+                tag.onload = () => {
+                    console.log('YouTube API script loaded');
+                    // Fallback in case callback doesn't fire
+                    setTimeout(() => {
+                        if (window.YT && window.YT.Player) {
+                            console.log('YouTube API ready via fallback');
+                            isApiReady.current = true;
+                            setApiLoading(false);
+                            resolve();
+                        }
+                    }, 1000);
+                };
+                
+                tag.onerror = () => {
+                    console.error('Failed to load YouTube API script');
+                    setApiLoading(false);
+                    reject(new Error('Failed to load YouTube API'));
+                };
+                
+                const firstScriptTag = document.getElementsByTagName('script')[0];
+                firstScriptTag.parentNode?.insertBefore(tag, firstScriptTag);
+            });
         };
 
-        loadYouTubeAPI();
+        loadYouTubeAPI().catch(error => {
+            console.error('Error loading YouTube API:', error);
+        });
 
         return () => {
             if (playerRef.current) {
@@ -169,10 +189,38 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
             return;
         }
 
-        if (isApiReady.current) {
+        // Wait for API to be ready before initializing
+        const initializePlayer = async () => {
+            console.log('🎬 Initializing player for track:', track.videoId);
+            setPlayerLoading(true);
+            
+            // Set a timeout to prevent infinite loading
+            const timeoutId = setTimeout(() => {
+                console.warn('⚠️ Player initialization timeout - forcing stop loading');
+                setPlayerLoading(false);
+                setPlayerReady(false);
+            }, 10000); // 10 second timeout
+            
+            // Wait for API to be ready
+            let attempts = 0;
+            while (!isApiReady.current && attempts < 50) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                attempts++;
+            }
+
+            if (!isApiReady.current) {
+                console.error('❌ YouTube API failed to load after 5 seconds');
+                setPlayerLoading(false);
+                clearTimeout(timeoutId);
+                return;
+            }
+
             if (playerRef.current && typeof playerRef.current.loadVideoById === 'function') {
                 try {
                     // Load new video
+                    console.log('🔄 Loading video:', track.videoId);
+                    clearTimeout(timeoutId);
+                    setPlayerLoading(false); // Stop loading immediately when using existing player
                     playerRef.current.loadVideoById(track.videoId);
                     
                     // Admin sends initial sync when track changes
@@ -192,134 +240,235 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
                         }, 1000);
                     }
                 } catch (error) {
-                    console.warn('Error loading video:', error);
+                    console.warn('⚠️ Error loading video, recreating player:', error);
+                    clearTimeout(timeoutId);
                     // Fallback: recreate player if loadVideoById fails
-                    playerRef.current = null;
+                    if (playerRef.current) {
+                        try {
+                            playerRef.current.destroy();
+                        } catch (e) {
+                            console.warn('Error destroying player:', e);
+                        }
+                        playerRef.current = null;
+                    }
+                    // Fall through to create new player
                 }
-            } else {
-                // Create new player
-                playerRef.current = new (window as any).YT.Player('youtube-player', {
-                    videoId: track.videoId,
-                    width: '100%',
-                    height: '100%',
-                    playerVars: {
-                        autoplay: isOwner ? 1 : 0, // Only auto-play for admin
-                        controls: isOwner ? 1 : 0, // Show YouTube controls only for admin
-                        modestbranding: 1,
-                        rel: 0,
-                        showinfo: 0,
-                        fs: 1, // Enable fullscreen
-                        playsinline: 1, // Important for mobile
-                        iv_load_policy: 3,
-                        color: 'white',
-                        enablejsapi: 1,
-                        origin: window.location.origin,
-                        // Mobile-specific parameters
-                        cc_load_policy: 0, // Disable closed captions by default
-                        disablekb: 0, // Enable keyboard controls
-                        end: undefined, // Don't set an end time
-                        hl: 'en', // Set interface language
-                        loop: 0, // Don't loop
-                        start: 0, // Start from beginning
-                        widget_referrer: window.location.origin
-                    },
-                    events: {
-                        onReady: (event: any) => {
-                            setPlayerReady(true);
-                            setDuration(event.target.getDuration());
-                            setProgress(event.target.getCurrentTime() || 0);
-                            
-                            if (isOwner) {
-                                // Auto-play for admin
-                                event.target.playVideo();
-                                
-                                // Send initial sync
-                                setTimeout(() => {
-                                    const currentTime = event.target.getCurrentTime();
-                                    const message = { 
-                                        type: 'playbackState', 
-                                        isPlaying: true, 
-                                        currentTime,
-                                        adminId: user?.uid 
-                                    };
-                                    sendJsonMessage(message);
-                                }, 500);
-                            }
+            }
+
+            if (!playerRef.current) {
+                console.log('🆕 Creating new YouTube player for video:', track.videoId);
+                
+                // Ensure the YouTube player container exists
+                const playerContainer = document.getElementById('youtube-player');
+                if (!playerContainer) {
+                    console.error('❌ YouTube player container not found!');
+                    setPlayerLoading(false);
+                    clearTimeout(timeoutId);
+                    return;
+                }
+                
+                // Detect mobile device
+                const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                console.log('📱 Is mobile device:', isMobile);
+                
+                // Create new player with mobile-optimized settings
+                try {
+                    console.log('Creating YouTube player with container check...');
+                    
+                    // Double-check container exists and clear any existing content
+                    const container = document.getElementById('youtube-player');
+                    if (container) {
+                        container.innerHTML = ''; // Clear any existing content
+                        console.log('Container cleared and ready');
+                    }
+                    
+                    playerRef.current = new (window as any).YT.Player('youtube-player', {
+                        videoId: track.videoId,
+                        width: '100%',
+                        height: '100%',
+                        playerVars: {
+                            autoplay: 0, // Never autoplay - requires user interaction on mobile
+                            controls: 1, // Always show controls for mobile compatibility
+                            modestbranding: 1,
+                            rel: 0,
+                            showinfo: 0,
+                            fs: 1, // Enable fullscreen
+                            playsinline: 1, // Critical for mobile - prevents opening in native player
+                            iv_load_policy: 3, // Hide annotations
+                            color: 'white',
+                            enablejsapi: 1,
+                            origin: window.location.origin,
+                            cc_load_policy: 0, // Disable closed captions by default
+                            disablekb: 0, // Enable keyboard controls for accessibility
+                            end: undefined,
+                            hl: 'en',
+                            loop: 0,
+                            start: 0,
+                            widget_referrer: window.location.origin,
+                            // Mobile specific optimizations
+                            mute: 0, // Don't mute by default - let user control
+                            wmode: 'opaque', // Helps with mobile rendering
                         },
-                        onStateChange: (event: any) => {
-                            try {
-                                const playerState = event.data;
-                                const newPlaying = playerState === (window as any).YT.PlayerState.PLAYING;
-                                const newPaused = playerState === (window as any).YT.PlayerState.PAUSED;
-                                const wasPlaying = isPlaying;
+                        events: {
+                            onReady: (event: any) => {
+                                console.log('🎬 YouTube player ready for video:', track.videoId);
+                                clearTimeout(timeoutId); // Clear timeout on success
+                                setPlayerReady(true);
+                                setPlayerLoading(false);
                                 
-                                console.log('State change:', { playerState, newPlaying, wasPlaying, isOwner });
-                                
-                                // Always update the playing state immediately
-                                setIsPlaying(newPlaying);
-                                
-                                // Update progress and duration when state changes
-                                if (event.target && typeof event.target.getCurrentTime === 'function') {
-                                    const currentTime = event.target.getCurrentTime();
+                                try {
                                     const videoDuration = event.target.getDuration();
+                                    const currentTime = event.target.getCurrentTime() || 0;
                                     
-                                    if (isValidTime(currentTime)) {
-                                        setProgress(currentTime);
-                                    }
-                                    if (videoDuration && videoDuration > 0 && isValidTime(videoDuration)) {
+                                    console.log('Video details:', { videoDuration, currentTime, isMobile });
+                                    
+                                    if (videoDuration && videoDuration > 0) {
                                         setDuration(videoDuration);
                                     }
-                                }
-                                
-                                // Handle member manual pause/play detection (non-admin only)
-                                if (!isOwner && !isSyncingRef.current) {
-                                    if (newPaused && wasPlaying) {
-                                        console.log('Member manually paused video');
-                                        setMemberPaused(true);
-                                    } else if (newPlaying && !wasPlaying && memberPaused) {
-                                        console.log('Member manually resumed video, syncing back to admin');
-                                        setMemberPaused(false);
-                                        sendJsonMessage({ type: 'requestState', from: user?.uid });
+                                    setProgress(currentTime);
+                                    
+                                    // For desktop admin, try to auto-play
+                                    if (isOwner && !isMobile) {
+                                        console.log('Desktop admin - attempting auto-play');
+                                        event.target.playVideo();
+                                        
+                                        // Send initial sync
+                                        setTimeout(() => {
+                                            const syncTime = event.target.getCurrentTime() || 0;
+                                            const message = { 
+                                                type: 'playbackState', 
+                                                isPlaying: true, 
+                                                currentTime: syncTime,
+                                                adminId: user?.uid 
+                                            };
+                                            sendJsonMessage(message);
+                                            console.log('🔄 Initial sync sent:', message);
+                                        }, 500);
+                                    } else {
+                                        console.log('Mobile/member - waiting for user interaction or admin sync');
                                     }
+                                } catch (error) {
+                                    console.warn('Error in onReady handler:', error);
+                                    setPlayerLoading(false);
                                 }
-                                
-                                // ADMIN: Send sync for ALL state changes (including YouTube control usage)
-                                if (isOwner) {
+                            },
+                            onStateChange: (event: any) => {
+                                try {
+                                    const playerState = event.data;
+                                    const newPlaying = playerState === (window as any).YT.PlayerState.PLAYING;
+                                    const newPaused = playerState === (window as any).YT.PlayerState.PAUSED;
+                                    const wasPlaying = isPlaying;
+                                    
+                                    console.log('State change:', { playerState, newPlaying, wasPlaying, isOwner, isMobile });
+                                    
+                                    // Always update the playing state immediately
+                                    setIsPlaying(newPlaying);
+                                    
+                                    // Update progress and duration when state changes
                                     if (event.target && typeof event.target.getCurrentTime === 'function') {
                                         const currentTime = event.target.getCurrentTime();
-                                        const message = { 
-                                            type: 'playbackState', 
-                                            isPlaying: newPlaying, 
-                                            currentTime,
-                                            adminId: user?.uid,
-                                            timestamp: Date.now(),
-                                            source: 'stateChange'
-                                        };
-                                        sendJsonMessage(message);
-                                        console.log('Admin sync sent:', message);
-                                        lastSyncTimeRef.current = Date.now();
+                                        const videoDuration = event.target.getDuration();
+                                        
+                                        if (isValidTime(currentTime)) {
+                                            setProgress(currentTime);
+                                        }
+                                        if (videoDuration && videoDuration > 0 && isValidTime(videoDuration)) {
+                                            setDuration(videoDuration);
+                                        }
                                     }
+                                    
+                                    // Handle member manual pause/play detection (non-admin only)
+                                    if (!isOwner && !isSyncingRef.current) {
+                                        if (newPaused && wasPlaying) {
+                                            console.log('Member manually paused video');
+                                            setMemberPaused(true);
+                                        } else if (newPlaying && !wasPlaying && memberPaused) {
+                                            console.log('Member manually resumed video, syncing back to admin');
+                                            setMemberPaused(false);
+                                            sendJsonMessage({ type: 'requestState', from: user?.uid });
+                                        }
+                                    }
+                                    
+                                    // ADMIN: Send sync for ALL state changes (including YouTube control usage)
+                                    if (isOwner) {
+                                        if (event.target && typeof event.target.getCurrentTime === 'function') {
+                                            const currentTime = event.target.getCurrentTime();
+                                            const message = { 
+                                                type: 'playbackState', 
+                                                isPlaying: newPlaying, 
+                                                currentTime,
+                                                adminId: user?.uid,
+                                                timestamp: Date.now(),
+                                                source: 'stateChange'
+                                            };
+                                            sendJsonMessage(message);
+                                            console.log('Admin sync sent:', message);
+                                            lastSyncTimeRef.current = Date.now();
+                                        }
+                                    }
+                                    
+                                    // Auto-play next video when current one ends (admin only)
+                                    if (playerState === (window as any).YT.PlayerState.ENDED && isOwner) {
+                                        console.log('Video ended, auto-playing next track');
+                                        sendJsonMessage({ 
+                                            type: 'trackEnded', 
+                                            message: 'Current track ended, starting next track...',
+                                            adminId: user?.uid 
+                                        });
+                                        playNextTrackInQueue(roomId);
+                                    }
+                                } catch (error) {
+                                    console.error('Error in onStateChange:', error);
+                                }
+                            },
+                            onError: (event: any) => {
+                                console.error('🚨 YouTube player error:', event.data);
+                                clearTimeout(timeoutId); // Clear timeout on error
+                                setPlayerLoading(false);
+                                setPlayerReady(false); // Mark as not ready on error
+                                
+                                // Handle different error codes
+                                switch (event.data) {
+                                    case 2:
+                                        console.error('Invalid video ID:', track.videoId);
+                                        break;
+                                    case 5:
+                                        console.error('Video cannot be played in HTML5 player');
+                                        break;
+                                    case 100:
+                                        console.error('Video not found or private');
+                                        break;
+                                    case 101:
+                                    case 150:
+                                        console.error('Video owner does not allow embedding');
+                                        break;
+                                    default:
+                                        console.error('Unknown YouTube error:', event.data);
                                 }
                                 
-                                // Auto-play next video when current one ends (admin only)
-                                if (playerState === (window as any).YT.PlayerState.ENDED && isOwner) {
-                                    console.log('Video ended, auto-playing next track');
-                                    sendJsonMessage({ 
-                                        type: 'trackEnded', 
-                                        message: 'Current track ended, starting next track...',
-                                        adminId: user?.uid 
-                                    });
-                                    playNextTrackInQueue(roomId);
+                                // On mobile, sometimes we need to retry
+                                if (isMobile) {
+                                    console.warn('Mobile error detected, may retry...');
                                 }
-                            } catch (error) {
-                                console.error('Error in onStateChange:', error);
                             }
                         }
+                    });
+                } catch (error) {
+                    console.error('❌ Error creating YouTube player:', error);
+                    clearTimeout(timeoutId);
+                    setPlayerLoading(false);
+                    
+                    // Mobile fallback - show a message with a direct link
+                    if (typeof window !== 'undefined' && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)) {
+                        console.warn('YouTube player failed on mobile, this is often due to mobile restrictions');
+                        // Could show a "Open in YouTube" button here as fallback
                     }
-                });
+                }
             }
-        }
-    }, [track?.id, roomId, isOwner, user?.uid, sendJsonMessage]);
+        };
+
+        initializePlayer();
+    }, [track?.id, roomId, isOwner, user?.uid, sendJsonMessage, isValidTime]);
 
     // Handle admin control transfer - reinitialize YouTube player when isOwner changes
     useEffect(() => {
@@ -463,12 +612,15 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
         }, 100);
     }, [isOwner]); // Only trigger when isOwner changes
 
-    // Sync function for non-admins
+    // Sync function for non-admins - improved for mobile
     const syncWithAdmin = useCallback((targetTime: number, targetPlaying: boolean) => {
         if (!isPlayerReady() || isSyncingRef.current || !isValidTime(targetTime)) {
             console.log('Sync skipped:', { ready: isPlayerReady(), syncing: isSyncingRef.current, valid: isValidTime(targetTime) });
             return;
         }
+
+        // Detect mobile device for sync adjustments
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
 
         try {
             isSyncingRef.current = true;
@@ -486,32 +638,41 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
                 currentPlaying, 
                 targetPlaying,
                 memberPaused,
-                threshold: SYNC_THRESHOLD
+                threshold: SYNC_THRESHOLD,
+                isMobile
             });
 
-            // Only sync if difference is significant (> 2 seconds) or play state is different
-            if (timeDiff > SYNC_THRESHOLD || (currentPlaying !== targetPlaying && !memberPaused)) {
-                console.log(`Member syncing: ${timeDiff > SYNC_THRESHOLD ? 'TIME' : ''}${currentPlaying !== targetPlaying ? ' PLAY' : ''}`);
+            // More aggressive sync threshold for mobile due to potential buffering issues
+            const syncThreshold = isMobile ? 1.5 : SYNC_THRESHOLD;
+            
+            // Only sync if difference is significant or play state is different
+            if (timeDiff > syncThreshold || (currentPlaying !== targetPlaying && !memberPaused)) {
+                console.log(`Member syncing: ${timeDiff > syncThreshold ? 'TIME' : ''}${currentPlaying !== targetPlaying ? ' PLAY' : ''}`);
                 
                 // Seek to the correct time first
-                if (timeDiff > SYNC_THRESHOLD) {
+                if (timeDiff > syncThreshold) {
                     player.seekTo(targetTime, true);
                     setProgress(targetTime); // Update UI immediately
                 }
 
-                // Then handle play state - but only if member hasn't manually paused
+                // Handle play state - but only if member hasn't manually paused
                 if (targetPlaying !== currentPlaying && !memberPaused) {
+                    // Mobile needs more time to process seek operations
+                    const delay = timeDiff > syncThreshold ? (isMobile ? 1000 : 500) : (isMobile ? 300 : 100);
+                    
                     setTimeout(() => {
                         try {
                             if (targetPlaying) {
+                                console.log('Attempting to play video for sync');
                                 player.playVideo();
                             } else {
+                                console.log('Attempting to pause video for sync');
                                 player.pauseVideo();
                             }
                         } catch (e) {
                             console.warn('Error changing play state:', e);
                         }
-                    }, timeDiff > SYNC_THRESHOLD ? 500 : 100); // Wait longer if we also seeked
+                    }, delay);
                 }
             } else {
                 console.log('Member already in sync');
@@ -519,10 +680,14 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
         } catch (error) {
             console.error('Error during sync:', error);
         } finally {
+            // Mobile needs more time to complete sync operations
+            const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+            const syncDelay = isMobile ? 1500 : 1000;
+            
             setTimeout(() => {
                 isSyncingRef.current = false;
                 setSyncStatus('connected');
-            }, 1000);
+            }, syncDelay);
         }
     }, [isPlayerReady, isValidTime, memberPaused]);
 
@@ -737,12 +902,73 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
                 <div className="aspect-video w-full relative bg-black/10">
                     {track ? (
                         <div className="relative w-full h-full bg-black">
-                            {/* YouTube player container */}
+                            {/* YouTube player container with proper ID and styling */}
                             <div 
                                 id="youtube-player" 
                                 className="w-full h-full absolute inset-0"
-                                style={{ backgroundColor: '#000' }}
+                                style={{ 
+                                    backgroundColor: '#000',
+                                    minHeight: '200px', // Ensure minimum height for mobile
+                                    width: '100%',
+                                    height: '100%',
+                                    // Mobile-specific optimizations
+                                    WebkitTransform: 'translate3d(0,0,0)', // Force hardware acceleration on mobile
+                                    transform: 'translate3d(0,0,0)',
+                                    position: 'relative', // Ensure proper positioning
+                                    zIndex: 1
+                                }}
                             ></div>
+                            
+                            {/* Loading overlay - only show for API loading, not player loading */}
+                            {apiLoading && (
+                                <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center z-20">
+                                    <Loader2 className="h-12 w-12 text-primary animate-spin mb-4" />
+                                    <div className="text-center space-y-2">
+                                        <p className="text-white font-medium">Loading YouTube API...</p>
+                                        <p className="text-white/70 text-sm">{track.title}</p>
+                                    </div>
+                                </div>
+                            )}
+                            
+                            {/* Mobile play button overlay - shown when video needs user interaction */}
+                            {(() => {
+                                const isMobile = typeof window !== 'undefined' && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                                // Show mobile play button if:
+                                // - On mobile device
+                                // - API is ready 
+                                // - Not currently loading API
+                                // - Video is paused or player hasn't started yet
+                                const showMobilePlayButton = isMobile && isApiReady.current && !apiLoading && !isPlaying;
+                                
+                                return showMobilePlayButton && (
+                                    <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-15">
+                                        <button
+                                            onClick={() => {
+                                                console.log('Mobile play button tapped - attempting to start video');
+                                                if (playerRef.current) {
+                                                    try {
+                                                        playerRef.current.playVideo();
+                                                    } catch (error) {
+                                                        console.warn('Error playing video from mobile button:', error);
+                                                    }
+                                                } else {
+                                                    console.warn('Player not ready, forcing player creation...');
+                                                    // Force player creation if it doesn't exist
+                                                    setPlayerLoading(true);
+                                                }
+                                            }}
+                                            className="bg-primary hover:bg-primary/90 text-white rounded-full p-6 shadow-lg transform hover:scale-105 transition-all"
+                                        >
+                                            <Play size={48} className="ml-1" />
+                                        </button>
+                                        <div className="absolute bottom-8 left-1/2 transform -translate-x-1/2">
+                                            <p className="text-white text-sm text-center bg-black/70 px-4 py-2 rounded-full">
+                                                Tap to play video
+                                            </p>
+                                        </div>
+                                    </div>
+                                );
+                            })()}
                             
                             {/* Fullscreen button overlay */}
                             <button 
@@ -823,6 +1049,42 @@ const VideoPlayer = memo(function VideoPlayer({ track, roomId, isOwner, queue = 
                                 </p>
                             </div>
                         )}
+                        
+                        {/* Mobile debug info - only show in development */}
+                        {(() => {
+                            const isMobile = typeof window !== 'undefined' && /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                            const isDev = process.env.NODE_ENV === 'development';
+                            
+                            return isMobile && isDev && (
+                                <div className="text-center mt-2 space-y-1">
+                                    <div className="text-xs bg-blue-500/20 text-blue-200 px-2 py-1 rounded">
+                                        📱 API: {isApiReady.current ? '✅' : '❌'} | 
+                                        Player: {playerReady ? '✅' : '❌'} | 
+                                        Playing: {isPlaying ? '▶️' : '⏸️'}
+                                    </div>
+                                    {!playerReady && (
+                                        <button
+                                            onClick={() => {
+                                                console.log('🔄 Force refresh player...');
+                                                if (playerRef.current) {
+                                                    try {
+                                                        playerRef.current.destroy();
+                                                    } catch (e) {}
+                                                    playerRef.current = null;
+                                                }
+                                                setPlayerReady(false);
+                                                setPlayerLoading(true);
+                                                // Trigger re-initialization
+                                                setTimeout(() => setPlayerLoading(false), 100);
+                                            }}
+                                            className="text-xs bg-orange-500/20 text-orange-200 px-2 py-1 rounded hover:bg-orange-500/30"
+                                        >
+                                            🔄 Retry Player
+                                        </button>
+                                    )}
+                                </div>
+                            );
+                        })()}
                     </div>
                 )}
             </CardContent>
